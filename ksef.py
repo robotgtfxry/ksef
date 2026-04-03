@@ -17,7 +17,7 @@ from pathlib import Path
 import configparser
 import re
 
-# ── Opcjonalne importy sieciowe ──────────────────────────────────────────────
+# ── Opcjonalne importy sieciowe ──────────────────────────────────────────────────
 try:
     import requests
     HAS_REQUESTS = True
@@ -52,10 +52,8 @@ FONT_BODY    = ("Segoe UI", 10)
 FONT_SMALL   = ("Segoe UI", 9)
 FONT_MONO    = ("Consolas", 9)
 
-# KSeF 2.0 – nowe adresy od 1 lutego 2026
+# KSeF 2.0 – adres produkcyjny
 API_ENDPOINTS = {
-    "integracyjne": "https://api-test.ksef.mf.gov.pl/v2",
-    "demo":         "https://api-demo.ksef.mf.gov.pl/v2",
     "produkcja":    "https://api.ksef.mf.gov.pl/v2",
 }
 
@@ -87,7 +85,7 @@ class Config:
 
     def _defaults(self):
         self.cfg["ksef"] = {
-            "environment": "integracyjne",
+            "environment": "produkcja",
             "nip": "",
             "token": "",
         }
@@ -116,8 +114,8 @@ class Config:
 class KSeFClient:
     """Prosty klient REST dla KSeF API."""
 
-    def __init__(self, env: str = "integracyjne"):
-        self.base_url      = API_ENDPOINTS.get(env, API_ENDPOINTS["integracyjne"])
+    def __init__(self, env: str = "produkcja"):
+        self.base_url      = API_ENDPOINTS.get(env, API_ENDPOINTS["produkcja"])
         self.token         = None   # token autoryzacyjny (API key z podatki.gov.pl)
         self.access_token  = None   # JWT Bearer – ważny ~5 min
         self.refresh_token = None   # JWT Refresh – ważny dłużej
@@ -723,17 +721,11 @@ class SessionTab(tk.Frame):
         self.token_entry = entry(fb, 1, show="*", width=50)
         self.token_entry.insert(0, self.app.config.get("ksef", "token"))
 
+        self.env_var = tk.StringVar(value="produkcja")
         labeled(fb, "Środowisko:", 2)
-        self.env_var = tk.StringVar(value=self.app.config.get("ksef", "environment", "integracyjne"))
-        env_frame = tk.Frame(fb, bg=COLOR_CARD)
-        env_frame.grid(row=2, column=1, sticky="w", padx=(0, 16), pady=5)
-        for env, lbl in [("integracyjne","Integracyjne (TEST)"),
-                          ("demo","Demo (przedprodukcyjne)"),
-                          ("produkcja","Produkcja")]:
-            tk.Radiobutton(env_frame, text=lbl, variable=self.env_var,
-                           value=env, bg=COLOR_CARD, fg=COLOR_TEXT,
-                           selectcolor=COLOR_BG, activebackground=COLOR_CARD,
-                           font=FONT_BODY).pack(side="left", padx=8)
+        tk.Label(fb, text="Produkcja (api.ksef.mf.gov.pl)",
+                 font=FONT_BODY, bg=COLOR_CARD, fg=COLOR_SUCCESS
+                 ).grid(row=2, column=1, sticky="w", padx=(0, 16), pady=5)
 
         # Przyciski
         btn_row = tk.Frame(fb, bg=COLOR_CARD)
@@ -1061,8 +1053,7 @@ class SendTab(tk.Frame):
     </DaneIdentyfikacyjne>
     <Adres>
       <KodKraju>PL</KodKraju>
-      <AdresL1>ul. Testowa 1</AdresL1>
-      <AdresL2>00-001 Warszawa</AdresL2>
+      <AdresL1>ul. Testowa 1, 00-001 Warszawa</AdresL1>
     </Adres>
   </Podmiot1>
   <Podmiot2>
@@ -1070,11 +1061,8 @@ class SendTab(tk.Frame):
       <NIP>9876543210</NIP>
       <Nazwa>Nabywca Testowy Sp. z o.o.</Nazwa>
     </DaneIdentyfikacyjne>
-    <Adres>
-      <KodKraju>PL</KodKraju>
-      <AdresL1>ul. Kupiecka 5</AdresL1>
-      <AdresL2>30-001 Kraków</AdresL2>
-    </Adres>
+    <JST>2</JST>
+    <GV>2</GV>
   </Podmiot2>
   <Fa>
     <KodWaluty>PLN</KodWaluty>
@@ -1089,9 +1077,16 @@ class SendTab(tk.Frame):
       <P_17>2</P_17>
       <P_18>2</P_18>
       <P_18A>2</P_18A>
-      <P_19>2</P_19>
-      <P_22>2</P_22>
+      <Zwolnienie>
+        <P_19N>1</P_19N>
+      </Zwolnienie>
+      <NoweSrodkiTransportu>
+        <P_22N>1</P_22N>
+      </NoweSrodkiTransportu>
       <P_23>2</P_23>
+      <PMarzy>
+        <P_PMarzyN>1</P_PMarzyN>
+      </PMarzy>
     </Adnotacje>
     <RodzajFaktury>VAT</RodzajFaktury>
     <FaWiersz>
@@ -1301,14 +1296,24 @@ class StatusTab(tk.Frame):
             try:
                 result = self.app.client.check_invoice_status(ref)
                 self.log.log(json.dumps(result, indent=2, ensure_ascii=False), "")
-                proc_status = result.get("processingCode", "?")
-                desc = {
-                    100: "Zakończono sukcesem (100)",
-                    200: "Przetwarzanie w toku (200)",
-                    300: "Błąd przetwarzania (300)",
-                }.get(proc_status, f"Kod: {proc_status}")
-                kind = "ok" if proc_status == 100 else ("warn" if proc_status == 200 else "error")
-                self.log.log(f"Status: {desc}", kind)
+                status_info = result.get("status", {})
+                status_code = status_info.get("code", 0)
+                status_desc = status_info.get("description", "")
+                ksef_nr = result.get("ksefNumber", "")
+                desc_map = {
+                    100: "Przyjęta do przetwarzania",
+                    150: "Trwa przetwarzanie",
+                    200: "Sukces",
+                    430: "Błąd weryfikacji pliku",
+                    435: "Błąd odszyfrowania",
+                    440: "Duplikat faktury",
+                    450: "Błąd semantyki dokumentu",
+                }
+                desc = desc_map.get(status_code, status_desc or f"Kod: {status_code}")
+                kind = "ok" if status_code == 200 else ("warn" if status_code < 300 else "error")
+                self.log.log(f"Status: {desc} ({status_code})", kind)
+                if ksef_nr:
+                    self.log.log(f"Numer KSeF: {ksef_nr}", "ok")
             except Exception as ex:
                 self.log.log(f"Błąd: {ex}", "error")
 
@@ -1320,19 +1325,26 @@ class StatusTab(tk.Frame):
             messagebox.showwarning("Brak danych", "Podaj numer referencyjny.")
             return
         save_path = filedialog.asksaveasfilename(
-            defaultextension=".pdf",
-            filetypes=[("PDF", "*.pdf"), ("XML", "*.xml")],
-            initialfile=f"UPO_{ref[:20]}.pdf"
+            defaultextension=".xml",
+            filetypes=[("XML", "*.xml"), ("Wszystkie", "*.*")],
+            initialfile=f"UPO_{ref[:20]}.xml"
         )
         if not save_path:
             return
 
         def _task():
             try:
-                result  = self.app.client.get_upo(ref)
-                upo_b64 = result.get("upo", "")
+                # KSeF 2.0: najpierw pobierz status z upoDownloadUrl
+                result = self.app.client.check_invoice_status(ref)
+                upo_url = result.get("upoDownloadUrl")
+                if not upo_url:
+                    self.log.log("UPO jeszcze niedostępne — spróbuj ponownie za chwilę.", "warn")
+                    return
+                # Pobierz UPO z URL (bez tokenu autoryzacyjnego)
+                upo_resp = requests.get(upo_url, timeout=30)
+                upo_resp.raise_for_status()
                 with open(save_path, "wb") as f:
-                    f.write(base64.b64decode(upo_b64))
+                    f.write(upo_resp.content)
                 self.log.log(f"UPO zapisane: {save_path}", "ok")
             except Exception as ex:
                 self.log.log(f"Błąd pobierania UPO: {ex}", "error")
@@ -1375,20 +1387,6 @@ class SettingsTab(tk.Frame):
                      fg=COLOR_SUCCESS if "" in val else
                      (COLOR_ERROR if "BRAK" in val else COLOR_TEXT)).grid(
                          row=i, column=1, sticky="w", padx=8, pady=3)
-
-        # Instrukcja budowania exe
-        build = Card(wrap, title="🔨  Budowanie pliku .exe (PyInstaller)")
-        build.pack(fill="x", pady=(0, 12))
-        instructions = (
-            "1. Zainstaluj PyInstaller:   pip install pyinstaller\n"
-            "2. W katalogu z plikiem ksef.py wykonaj:\n\n"
-            "   pyinstaller --onefile --windowed --name KSeF_Desktop \\\n"
-            "               --icon=ksef_icon.ico ksef.py\n\n"
-            "3. Plik EXE pojawi się w folderze dist/\n"
-            "   Nie wymaga instalacji Pythona na docelowym komputerze."
-        )
-        tk.Label(build.body, text=instructions, font=FONT_MONO, bg=COLOR_CARD,
-                 fg=COLOR_TEXT, justify="left").pack(anchor="w", padx=16, pady=(4, 12))
 
         btn_row = tk.Frame(wrap, bg=COLOR_BG)
         btn_row.pack(anchor="w", pady=8)
@@ -1593,8 +1591,7 @@ def build_fa3_xml(d: dict) -> str:
     </DaneIdentyfikacyjne>
     <Adres>
       <KodKraju>PL</KodKraju>
-      <AdresL1>{sp_l1}</AdresL1>
-      <AdresL2>{sp_l2}</AdresL2>
+      <AdresL1>{sp_l1}, {sp_l2}</AdresL1>
     </Adres>
   </Podmiot1>
   <Podmiot2>
@@ -1602,11 +1599,8 @@ def build_fa3_xml(d: dict) -> str:
       <NIP>{nab['nip']}</NIP>
       <Nazwa>{nab_nazwa}</Nazwa>
     </DaneIdentyfikacyjne>
-    <Adres>
-      <KodKraju>PL</KodKraju>
-      <AdresL1>{nab_l1}</AdresL1>
-      <AdresL2>{nab_l2}</AdresL2>
-    </Adres>
+    <JST>2</JST>
+    <GV>2</GV>
   </Podmiot2>
   <Fa>
     <KodWaluty>PLN</KodWaluty>
@@ -1619,9 +1613,16 @@ def build_fa3_xml(d: dict) -> str:
       <P_17>2</P_17>
       <P_18>2</P_18>
       <P_18A>2</P_18A>
-      <P_19>2</P_19>
-      <P_22>2</P_22>
+      <Zwolnienie>
+        <P_19N>1</P_19N>
+      </Zwolnienie>
+      <NoweSrodkiTransportu>
+        <P_22N>1</P_22N>
+      </NoweSrodkiTransportu>
       <P_23>2</P_23>
+      <PMarzy>
+        <P_PMarzyN>1</P_PMarzyN>
+      </PMarzy>
     </Adnotacje>
     <RodzajFaktury>VAT</RodzajFaktury>{wiersze_xml}
   </Fa>
@@ -1841,7 +1842,7 @@ class App(tk.Tk):
             pass
 
         self.config  = Config()
-        self.client  = KSeFClient(self.config.get("ksef", "environment", "integracyjne"))
+        self.client  = KSeFClient(self.config.get("ksef", "environment", "produkcja"))
         self.client.token = self.config.get("ksef", "token")
 
         self._build_ui()
