@@ -122,6 +122,8 @@ class KSeFClient:
         self.access_token  = None   # JWT Bearer – ważny ~5 min
         self.refresh_token = None   # JWT Refresh – ważny dłużej
         self.session_ref   = None   # numer referencyjny sesji
+        self._aes_key      = None   # klucz AES-256 (32 bajty) do szyfrowania faktur
+        self._aes_iv       = None   # wektor IV (16 bajtów)
 
     # ── helpers ─────────────────────────────────────────────────────────────
     def _headers(self, extra: dict | None = None) -> dict:
@@ -145,6 +147,11 @@ class KSeFClient:
         if not HAS_REQUESTS:
             raise RuntimeError("Brak biblioteki 'requests'. Zainstaluj: pip install requests")
         headers = self._headers(extra_headers)
+
+        # Dla KSeF 2.0 - dodaj referencję sesji jeśli istnieje
+        if self.session_ref and "invoices" in path:
+            headers["X-KSEF-ReferenceNumber"] = self.session_ref
+
         if raw:
             headers["Content-Type"] = "application/octet-stream"
             r = requests.post(f"{self.base_url}{path}", headers=headers,
@@ -152,29 +159,41 @@ class KSeFClient:
         else:
             r = requests.post(f"{self.base_url}{path}", headers=headers,
                               json=payload, timeout=60)
-        r.raise_for_status()
+
+        # Lepsza obsługa błędów
+        if r.status_code >= 400:
+            error_msg = f"HTTP {r.status_code}: {r.text}"
+            raise RuntimeError(error_msg)
+
         try:
             return r.json()
         except Exception:
             return {"status": r.status_code, "raw": r.text}
 
     # ── autoryzacja KSeF 2.0 – token KSeF z szyfrowaniem RSA-OAEP ──────────
-    def _get_public_key_pem(self) -> bytes:
-        """Pobiera klucz publiczny KSeF do szyfrowania tokenu."""
+    def _get_public_key_cert(self, usage: str = "KsefTokenEncryption") -> bytes:
+        """
+        Pobiera certyfikat klucza publicznego KSeF.
+        usage: 'KsefTokenEncryption'      – do szyfrowania tokenu autoryzacyjnego
+               'SymmetricKeyEncryption'    – do szyfrowania klucza AES sesji online
+        """
         result = self._get("/security/public-key-certificates")
-        # Struktura: [{type, certificate (base64 DER)}]
-        for cert_info in result if isinstance(result, list) else result.get("items", [result]):
-            cert_type = cert_info.get("type", "")
-            if "SymmetricKey" in cert_type or "Token" in cert_type or cert_type == "":
-                cert_b64 = cert_info.get("certificate") or cert_info.get("value", "")
+        items = result if isinstance(result, list) else result.get("items", [])
+
+        # Szukaj certyfikatu z odpowiednim usage
+        for cert_info in items:
+            usages = cert_info.get("usage", [])
+            if usage in usages:
+                cert_b64 = cert_info.get("certificate", "")
                 if cert_b64:
                     return base64.b64decode(cert_b64)
-        # fallback: pierwszy certyfikat
-        items = result if isinstance(result, list) else result.get("items", [])
+
+        # Fallback: pierwszy dostępny certyfikat
         if items:
-            cert_b64 = items[0].get("certificate") or items[0].get("value", "")
-            return base64.b64decode(cert_b64)
-        raise RuntimeError(f"Nie znaleziono certyfikatu do szyfrowania: {result}")
+            cert_b64 = items[0].get("certificate", "")
+            if cert_b64:
+                return base64.b64decode(cert_b64)
+        raise RuntimeError(f"Nie znaleziono certyfikatu ({usage}): {result}")
 
     def _encrypt_token(self, token: str, cert_der: bytes,
                         challenge_ts=None) -> str:
@@ -231,8 +250,8 @@ class KSeFClient:
         """
         import time
 
-        # Krok 1: klucz publiczny do szyfrowania
-        cert_der = self._get_public_key_pem()
+        # Krok 1: klucz publiczny do szyfrowania tokenu
+        cert_der = self._get_public_key_cert("KsefTokenEncryption")
 
         # Krok 2: challenge
         ch_result = self._post("/auth/challenge", {})
@@ -296,6 +315,83 @@ class KSeFClient:
             raise RuntimeError(f"Brak accessToken po redeem: {redeem}")
         return redeem
 
+    def open_online_session(self, form_code: str = "FA",
+                            schema_version: str = "1-0E",
+                            system_code: str = "FA (3)") -> dict:
+        """
+        POST /sessions/online – otwiera sesję interaktywną KSeF 2.0.
+
+        Generuje losowy klucz AES-256 + IV, szyfruje klucz kluczem publicznym MF
+        (RSA-OAEP/SHA-256) i wysyła do API.  Klucz AES jest potem używany
+        do szyfrowania faktur przed wysyłką.
+        """
+        try:
+            from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.x509 import load_der_x509_certificate
+        except ImportError:
+            raise RuntimeError("Brak biblioteki 'cryptography'. Zainstaluj: pip install cryptography")
+
+        # 1. Wygeneruj losowy klucz AES-256 (32 B) i IV (16 B)
+        self._aes_key = os.urandom(32)
+        self._aes_iv  = os.urandom(16)
+
+        # 2. Pobierz klucz publiczny MF do szyfrowania klucza symetrycznego
+        cert_der = self._get_public_key_cert("SymmetricKeyEncryption")
+        cert     = load_der_x509_certificate(cert_der)
+        pub_key  = cert.public_key()
+        encrypted_key = pub_key.encrypt(
+            self._aes_key,
+            asym_padding.OAEP(
+                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+
+        # 3. POST /sessions/online
+        payload = {
+            "formCode": {
+                "systemCode":    system_code,
+                "schemaVersion": schema_version,
+                "value":         form_code,
+            },
+            "encryption": {
+                "encryptedSymmetricKey": base64.b64encode(encrypted_key).decode(),
+                "initializationVector":  base64.b64encode(self._aes_iv).decode(),
+            },
+        }
+        result = self._post("/sessions/online", payload)
+        self.session_ref = result.get("referenceNumber")
+        if not self.session_ref:
+            raise RuntimeError(f"Brak referenceNumber z /sessions/online: {result}")
+        return result
+
+    def close_online_session(self) -> dict:
+        """POST /sessions/online/{ref}/close – zamyka sesję interaktywną."""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji.")
+        result = self._post(f"/sessions/online/{self.session_ref}/close", {})
+        self.session_ref = None
+        self._aes_key    = None
+        self._aes_iv     = None
+        return result
+
+    def _encrypt_aes(self, data: bytes) -> bytes:
+        """Szyfruje dane AES-256-CBC z PKCS#7 padding."""
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives import padding as sym_padding
+        except ImportError:
+            raise RuntimeError("Brak 'cryptography'.")
+        if not self._aes_key or not self._aes_iv:
+            raise RuntimeError("Brak klucza AES – najpierw otwórz sesję online.")
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(data) + padder.finalize()
+        cipher = Cipher(algorithms.AES(self._aes_key), modes.CBC(self._aes_iv))
+        enc    = cipher.encryptor()
+        return enc.update(padded) + enc.finalize()
+
     def refresh_access_token(self) -> dict:
         """POST /auth/token/refresh – odświeża JWT używając refreshToken."""
         if not self.refresh_token:
@@ -322,45 +418,65 @@ class KSeFClient:
 
     # ── faktury KSeF 2.0 ────────────────────────────────────────────────────
     def send_invoice(self, xml_content: str) -> dict:
-        """POST /invoices/send – wysyłka w sesji interaktywnej."""
-        xml_bytes = xml_content.encode("utf-8")
-        b64       = base64.b64encode(xml_bytes).decode()
-        sha256_b64 = base64.b64encode(hashlib.sha256(xml_bytes).digest()).decode()
+        """POST /sessions/online/{ref}/invoices – wysyłka zaszyfrowanej faktury."""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji KSeF. Najpierw otwórz sesję w zakładce 'Sesja'.")
+        if not self._aes_key:
+            raise RuntimeError("Brak klucza AES – otwórz sesję online ponownie.")
+
+        # Oryginalna faktura
+        xml_bytes       = xml_content.encode("utf-8")
+        invoice_hash    = base64.b64encode(hashlib.sha256(xml_bytes).digest()).decode()
+        invoice_size    = len(xml_bytes)
+
+        # Zaszyfrowana faktura (AES-256-CBC, PKCS#7)
+        encrypted_bytes = self._encrypt_aes(xml_bytes)
+        enc_hash        = base64.b64encode(hashlib.sha256(encrypted_bytes).digest()).decode()
+        enc_size        = len(encrypted_bytes)
+        enc_b64         = base64.b64encode(encrypted_bytes).decode()
+
         payload = {
-            "invoiceBody": b64,
-            "contentType": "application/xml",
-            "hashSHA256":  sha256_b64,
+            "invoiceHash":             invoice_hash,
+            "invoiceSize":             invoice_size,
+            "encryptedInvoiceHash":    enc_hash,
+            "encryptedInvoiceSize":    enc_size,
+            "encryptedInvoiceContent": enc_b64,
         }
-        return self._post("/invoices/send", payload)
+        return self._post(f"/sessions/online/{self.session_ref}/invoices", payload)
 
     def check_invoice_status(self, reference_no: str) -> dict:
-        """GET /invoices/{referenceNumber}/status"""
-        return self._get(f"/invoices/{reference_no}/status")
+        """GET /sessions/{sessionRef}/invoices/{referenceNumber}"""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji KSeF.")
+        return self._get(f"/sessions/{self.session_ref}/invoices/{reference_no}")
 
     def query_invoices(self, date_from: str, date_to: str,
                        subject_type: str = "subject1") -> dict:
-        """POST /invoices/query – wyszukiwanie faktur."""
-        payload = {
-            "dateFrom":    date_from,
-            "dateTo":      date_to,
-            "subjectType": subject_type,
-            "pageSize":    50,
-        }
-        return self._post("/invoices/query", payload)
+        """GET /sessions/{sessionRef}/invoices – wyszukiwanie faktur w sesji KSeF 2.0."""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji KSeF.")
+        return self._get(f"/sessions/{self.session_ref}/invoices")
 
     def download_invoice(self, ksef_ref: str) -> dict:
-        """GET /invoices/{ksefReferenceNumber} – pobranie faktury."""
-        return self._get(f"/invoices/{ksef_ref}")
+        """GET /sessions/{sessionRef}/invoices/{ksefReferenceNumber} – pobranie faktury."""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji KSeF.")
+        return self._get(f"/sessions/{self.session_ref}/invoices/{ksef_ref}")
 
     def get_upo(self, reference_no: str) -> dict:
-        """GET /invoices/{referenceNumber}/upo – pobranie UPO."""
-        return self._get(f"/invoices/{reference_no}/upo")
+        """GET /sessions/{sessionRef}/invoices/{referenceNumber}/upo – pobranie UPO."""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji KSeF.")
+        return self._get(f"/sessions/{self.session_ref}/invoices/{reference_no}/upo")
 
     def validate_invoice(self, xml_content: str) -> dict:
-        """POST /invoices/validate – walidacja XML bez wysyłki."""
+        """POST /sessions/online/{ref}/invoices/validate – walidacja XML bez wysyłki."""
+        if not self.session_ref:
+            raise RuntimeError("Brak aktywnej sesji KSeF.")
         xml_bytes = xml_content.encode("utf-8")
         b64 = base64.b64encode(xml_bytes).decode()
-        return self._post("/invoices/validate", {"invoiceBody": b64})
+        return self._post(f"/sessions/online/{self.session_ref}/invoices/validate",
+                          {"invoiceBody": b64})
 
     def check_connection(self) -> bool:
         try:
@@ -404,7 +520,12 @@ class FlatButton(tk.Label):
     @staticmethod
     def _darken(hex_color: str) -> str:
         c = hex_color.lstrip("#")
-        r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        if len(c) != 6:
+            return hex_color
+        try:
+            r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+        except ValueError:
+            return hex_color
         return "#{:02x}{:02x}{:02x}".format(max(r-30, 0), max(g-30, 0), max(b-30, 0))
 
 
@@ -522,18 +643,18 @@ class DashboardTab(tk.Frame):
         row = tk.Frame(qa.body, bg=COLOR_CARD)
         row.pack(padx=16, pady=12)
         btns = [
-            ("📤  Wyślij fakturę", self._goto_send,  COLOR_ACCENT),
-            ("🔄  Konwerter CR→FA(3)", self._goto_conv, "#2e5070"),
-            ("📥  Pobierz faktury", self._goto_recv, COLOR_ACCENT2),
-            ("🔍  Sprawdź status", self._goto_status, "#2e7d52"),
-            ("🔐  Sesja", self._goto_auth, "#7d4e2e"),
+            ("  Wyślij fakturę", self._goto_send,  COLOR_ACCENT),
+            ("  Konwerter CR→FA(3)", self._goto_conv, "#2e5070"),
+            ("  Pobierz faktury", self._goto_recv, COLOR_ACCENT2),
+            ("  Sprawdź status", self._goto_status, "#2e7d52"),
+            ("  Sesja", self._goto_auth, "#7d4e2e"),
         ]
         for txt, cmd, col in btns:
             FlatButton(row, text=txt, command=cmd, color=col).pack(
                 side="left", padx=6)
 
         # Log zdarzeń
-        log_card = Card(self, title="📋  Dziennik zdarzeń")
+        log_card = Card(self, title="  Dziennik zdarzeń")
         log_card.pack(fill="both", expand=True, padx=24, pady=(4, 12))
         self.log = LogBox(log_card.body)
         self.log.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -584,7 +705,7 @@ class SessionTab(tk.Frame):
     def _build(self):
         wrap = tk.Frame(self, bg=COLOR_BG)
         wrap.pack(fill="both", expand=True, padx=24, pady=24)
-        tk.Label(wrap, text="🔐  Zarządzanie sesją", font=FONT_TITLE,
+        tk.Label(wrap, text="  Zarządzanie sesją", font=FONT_TITLE,
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 16))
 
         # Dane do logowania
@@ -617,11 +738,11 @@ class SessionTab(tk.Frame):
         # Przyciski
         btn_row = tk.Frame(fb, bg=COLOR_CARD)
         btn_row.grid(row=3, column=0, columnspan=2, pady=12, padx=16, sticky="w")
-        FlatButton(btn_row, "💾  Zapisz dane",     self._save,    COLOR_ACCENT2).pack(side="left", padx=4)
-        FlatButton(btn_row, "🔗  Otwórz sesję",   self._open,    COLOR_ACCENT ).pack(side="left", padx=4)
-        FlatButton(btn_row, "🔄  Odśwież token",  self._refresh, "#2e6b2e"    ).pack(side="left", padx=4)
-        FlatButton(btn_row, "⏹  Zamknij sesję",  self._close,   COLOR_ERROR  ).pack(side="left", padx=4)
-        FlatButton(btn_row, "📡  Ping API",        self._ping,    "#555"       ).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Zapisz dane",     self._save,    COLOR_ACCENT2).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Otwórz sesję",   self._open,    COLOR_ACCENT ).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Odśwież token",  self._refresh, "#2e6b2e"    ).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Zamknij sesję",  self._close,   COLOR_ERROR  ).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Ping API",        self._ping,    "#555"       ).pack(side="left", padx=4)
 
         # Log sesji
         log_card = Card(wrap, title="Log sesji")
@@ -662,21 +783,28 @@ class SessionTab(tk.Frame):
 
         def _task():
             try:
-                self.log.log("Krok 1/6: pobieranie klucza publicznego RSA…", "info")
+                self.log.log("Krok 1/7: pobieranie klucza publicznego RSA…", "info")
                 result = self.app.client.init_session_token(nip, token)
                 if self.app.client.access_token:
                     at_short = self.app.client.access_token[:24]
-                    ref = self.app.client.session_ref or "brak"
-                    self.log.log("Krok 2/6: challenge pobrany ✔", "ok")
-                    self.log.log("Krok 3/6: token zaszyfrowany RSA-OAEP ✔", "ok")
-                    self.log.log("Krok 4/6: token KSeF wysłany ✔", "ok")
-                    self.log.log("Krok 5/6: status autoryzacji OK ✔", "ok")
-                    self.log.log("Krok 6/6: JWT access token otrzymany ✔", "ok")
-                    self.log.log(f"Numer referencyjny sesji: {ref}", "ok")
+                    self.log.log("Krok 2/7: challenge pobrany ✔", "ok")
+                    self.log.log("Krok 3/7: token zaszyfrowany RSA-OAEP ✔", "ok")
+                    self.log.log("Krok 4/7: token KSeF wysłany ✔", "ok")
+                    self.log.log("Krok 5/7: status autoryzacji OK ✔", "ok")
+                    self.log.log("Krok 6/7: JWT access token otrzymany ✔", "ok")
                     self.log.log(f"Access token (JWT): {at_short}…", "ok")
+
+                    # Krok 7: otwórz sesję interaktywną (z kluczem AES do szyfrowania faktur)
+                    self.log.log("Krok 7/7: otwieranie sesji online (AES-256)…", "info")
+                    session_result = self.app.client.open_online_session()
+                    ref = self.app.client.session_ref or "brak"
+                    self.log.log(f"Sesja online otwarta ✔  ref: {ref}", "ok")
+                    valid_until = session_result.get("validUntil", "?")
+                    self.log.log(f"Sesja ważna do: {valid_until}", "info")
+
                     self.app.dashboard.update_stats(session="Aktywna", api_status="OK")
                     self.app.status_bar.set_connected(True, self.env_var.get())
-                    self.app.dashboard.log.log("Sesja KSeF 2.0 otwarta pomyślnie (token→JWT).", "ok")
+                    self.app.dashboard.log.log("Sesja KSeF 2.0 otwarta pomyślnie (token→JWT→online).", "ok")
                 else:
                     self.log.log(f"Odpowiedź API: {json.dumps(result, indent=2, ensure_ascii=False)}", "warn")
             except Exception as ex:
@@ -692,8 +820,12 @@ class SessionTab(tk.Frame):
 
         def _task():
             try:
+                # Zamknij sesję online (jeśli otwarta)
+                if self.app.client.session_ref:
+                    self.app.client.close_online_session()
+                    self.log.log("Sesja online zamknięta.", "ok")
                 self.app.client.terminate_session()
-                self.log.log("Sesja zamknięta.", "ok")
+                self.log.log("Sesja JWT zamknięta.", "ok")
                 self.app.dashboard.update_stats(session="Brak")
                 self.app.status_bar.set_connected(False, self.env_var.get())
             except Exception as ex:
@@ -749,7 +881,7 @@ class SendTab(tk.Frame):
     def _build(self):
         wrap = tk.Frame(self, bg=COLOR_BG)
         wrap.pack(fill="both", expand=True, padx=24, pady=24)
-        tk.Label(wrap, text="📤  Wyślij fakturę", font=FONT_TITLE,
+        tk.Label(wrap, text="  Wyślij fakturę", font=FONT_TITLE,
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 16))
 
         # Wybór pliku
@@ -760,7 +892,7 @@ class SendTab(tk.Frame):
         self.file_var = tk.StringVar(value="Brak wybranego pliku")
         tk.Label(row, textvariable=self.file_var, font=FONT_BODY,
                  bg=COLOR_CARD, fg=COLOR_MUTED, anchor="w").pack(side="left", fill="x", expand=True)
-        FlatButton(row, "📂  Wybierz plik", self._pick_file, color="#444").pack(side="right")
+        FlatButton(row, "  Wybierz plik", self._pick_file, color="#444").pack(side="right")
 
         # Podgląd XML
         prev_card = Card(wrap, title="Podgląd treści XML")
@@ -771,15 +903,15 @@ class SendTab(tk.Frame):
             height=12
         )
         self.xml_view.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        FlatButton(prev_card.body, "📝  Wstaw przykładową FA(3) – KSeF 2.0",
+        FlatButton(prev_card.body, "  Wstaw przykładową FA(3) – KSeF 2.0",
                    self._insert_sample, color="#2e5050").pack(anchor="w", padx=12, pady=(0, 10))
 
         # Akcje
         action_row = tk.Frame(wrap, bg=COLOR_BG)
         action_row.pack(fill="x", pady=4)
-        FlatButton(action_row, "✅  Waliduj XML", self._validate, "#2e6b2e").pack(side="left")
-        FlatButton(action_row, "🚀  Wyślij do KSeF", self._send, COLOR_ACCENT).pack(side="left", padx=8)
-        FlatButton(action_row, "🗑  Wyczyść", self._clear, "#444").pack(side="left")
+        FlatButton(action_row, "  Waliduj XML", self._validate, "#2e6b2e").pack(side="left")
+        FlatButton(action_row, "  Wyślij do KSeF", self._send, COLOR_ACCENT).pack(side="left", padx=8)
+        FlatButton(action_row, "  Wyczyść", self._clear, "#444").pack(side="left")
 
         # Wynik
         res_card = Card(wrap, title="Wynik wysyłki")
@@ -859,7 +991,7 @@ class SendTab(tk.Frame):
         try:
             root = ET.fromstring(xml_content.encode("utf-8"))
         except ET.ParseError as ex:
-            self.result_log.log(f"❌ Błąd składni XML: {ex}", "error")
+            self.result_log.log(f" Błąd składni XML: {ex}", "error")
             return
 
         self.result_log.log("✔  Składnia XML poprawna", "ok")
@@ -867,12 +999,12 @@ class SendTab(tk.Frame):
         # 2) Sprawdź namespace FA(3)
         ns = root.tag
         if "19456" in ns or "FA(3)" in xml_content or "WariantFormularza>3" in xml_content:
-            self.result_log.log("✔  Schemat FA(3) wykryty", "ok")
+            self.result_log.log("  Schemat FA(3) wykryty", "ok")
         elif "12648" in ns or "FA(2)" in xml_content:
-            self.result_log.log("⚠  Schemat FA(2) – od 01.02.2026 wymagany FA(3)!", "warn")
+            self.result_log.log("  Schemat FA(2) – od 01.02.2026 wymagany FA(3)!", "warn")
             errors.append("Użyj schematu FA(3)")
         else:
-            self.result_log.log("⚠  Nie rozpoznano wersji schematu", "warn")
+            self.result_log.log(" Nie rozpoznano wersji schematu", "warn")
 
         # 3) Sprawdź obowiązkowe elementy
         xml_text = xml_content
@@ -903,7 +1035,7 @@ class SendTab(tk.Frame):
 
         # 5) Wynik
         if errors:
-            self.result_log.log(f"❌ Znaleziono {len(errors)} problem(y):", "error")
+            self.result_log.log(f" Znaleziono {len(errors)} problem(y):", "error")
             for e in errors:
                 self.result_log.log(f"   • {e}", "warn")
         else:
@@ -914,18 +1046,18 @@ class SendTab(tk.Frame):
         nip = "1234567890"
         today = datetime.date.today().isoformat()
         return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Faktura xmlns="http://crd.gov.pl/wzor/2024/11/25/19456/"
+<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Naglowek>
-    <KodFormularza kodSystemowy="FA(3)" wersjaSchemy="1-0E">FA</KodFormularza>
+    <KodFormularza kodSystemowy="FA (3)" wersjaSchemy="1-0E">FA</KodFormularza>
     <WariantFormularza>3</WariantFormularza>
-    <DataWytworzeniaFa>{datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')}</DataWytworzeniaFa>
+    <DataWytworzeniaFa>{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')}</DataWytworzeniaFa>
     <SystemInfo>KSeF Desktop v{APP_VERSION}</SystemInfo>
   </Naglowek>
   <Podmiot1>
     <DaneIdentyfikacyjne>
       <NIP>{nip}</NIP>
-      <PelnaNazwa>Przykładowa Spółka Sp. z o.o.</PelnaNazwa>
+      <Nazwa>Przykładowa Spółka Sp. z o.o.</Nazwa>
     </DaneIdentyfikacyjne>
     <Adres>
       <KodKraju>PL</KodKraju>
@@ -936,7 +1068,7 @@ class SendTab(tk.Frame):
   <Podmiot2>
     <DaneIdentyfikacyjne>
       <NIP>9876543210</NIP>
-      <PelnaNazwa>Nabywca Testowy Sp. z o.o.</PelnaNazwa>
+      <Nazwa>Nabywca Testowy Sp. z o.o.</Nazwa>
     </DaneIdentyfikacyjne>
     <Adres>
       <KodKraju>PL</KodKraju>
@@ -987,7 +1119,7 @@ class ReceiveTab(tk.Frame):
     def _build(self):
         wrap = tk.Frame(self, bg=COLOR_BG)
         wrap.pack(fill="both", expand=True, padx=24, pady=24)
-        tk.Label(wrap, text="📥  Wyszukaj i pobierz faktury", font=FONT_TITLE,
+        tk.Label(wrap, text="  Wyszukaj i pobierz faktury", font=FONT_TITLE,
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 16))
 
         # Filtry
@@ -1017,8 +1149,8 @@ class ReceiveTab(tk.Frame):
 
         btn_row = tk.Frame(fb, bg=COLOR_CARD)
         btn_row.grid(row=2, column=0, columnspan=4, pady=10, padx=16, sticky="w")
-        FlatButton(btn_row, "🔍  Szukaj", self._search, COLOR_ACCENT).pack(side="left", padx=4)
-        FlatButton(btn_row, "📋  Pobierz zaznaczoną", self._download_selected,
+        FlatButton(btn_row, "  Szukaj", self._search, COLOR_ACCENT).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Pobierz zaznaczoną", self._download_selected,
                    COLOR_ACCENT2).pack(side="left", padx=4)
 
         # Lista wyników
@@ -1132,7 +1264,7 @@ class StatusTab(tk.Frame):
     def _build(self):
         wrap = tk.Frame(self, bg=COLOR_BG)
         wrap.pack(fill="both", expand=True, padx=24, pady=24)
-        tk.Label(wrap, text="🔍  Status faktury", font=FONT_TITLE,
+        tk.Label(wrap, text="  Status faktury", font=FONT_TITLE,
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 16))
 
         q_card = Card(wrap, title="Sprawdź po numerze referencyjnym")
@@ -1145,8 +1277,8 @@ class StatusTab(tk.Frame):
 
         btn_row = tk.Frame(qb, bg=COLOR_CARD)
         btn_row.grid(row=1, column=0, columnspan=2, pady=10, padx=16, sticky="w")
-        FlatButton(btn_row, "🔍  Sprawdź status",  self._check_status, COLOR_ACCENT).pack(side="left", padx=4)
-        FlatButton(btn_row, "📄  Pobierz UPO",     self._get_upo,      COLOR_ACCENT2).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Sprawdź status",  self._check_status, COLOR_ACCENT).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Pobierz UPO",     self._get_upo,      COLOR_ACCENT2).pack(side="left", padx=4)
 
         # Wynik
         res = Card(wrap, title="Wynik")
@@ -1220,7 +1352,7 @@ class SettingsTab(tk.Frame):
     def _build(self):
         wrap = tk.Frame(self, bg=COLOR_BG)
         wrap.pack(fill="both", expand=True, padx=24, pady=24)
-        tk.Label(wrap, text="⚙  Ustawienia", font=FONT_TITLE,
+        tk.Label(wrap, text="  Ustawienia", font=FONT_TITLE,
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 16))
 
         # Informacje o programie
@@ -1233,14 +1365,14 @@ class SettingsTab(tk.Frame):
             ("Schemat faktury:", "FA(3)"),
             ("Interpreter Python:", sys.version.split()[0]),
             ("Plik konfiguracji:", CONFIG_FILE),
-            ("requests:", "zainstalowany ✔" if HAS_REQUESTS else "BRAK — pip install requests"),
-            ("cryptography:", "zainstalowana ✔" if HAS_CRYPTO else "BRAK — pip install cryptography"),
+            ("requests:", "zainstalowany " if HAS_REQUESTS else "BRAK — pip install requests"),
+            ("cryptography:", "zainstalowana " if HAS_CRYPTO else "BRAK — pip install cryptography"),
         ]
         for i, (lbl, val) in enumerate(rows):
             tk.Label(info.body, text=lbl, font=FONT_BODY, bg=COLOR_CARD,
                      fg=COLOR_MUTED).grid(row=i, column=0, sticky="w", padx=16, pady=3)
             tk.Label(info.body, text=val, font=FONT_BODY, bg=COLOR_CARD,
-                     fg=COLOR_SUCCESS if "✔" in val else
+                     fg=COLOR_SUCCESS if "" in val else
                      (COLOR_ERROR if "BRAK" in val else COLOR_TEXT)).grid(
                          row=i, column=1, sticky="w", padx=8, pady=3)
 
@@ -1374,20 +1506,32 @@ def parse_crystal_xml(xml_content: str) -> dict:
 
 def build_fa3_xml(d: dict) -> str:
     """Buduje XML FA(3) z danych słownikowych."""
-    now_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    # Oblicz kwoty per stawka VAT
+    # Kwoty per stawka VAT — bierz z tabeli VAT (vat_rows), nie z pozycji
     vat_groups = {}
-    for row in d['items']:
-        stawka = row.get('z1StawkaVATf1', '23').replace('%', '').strip()
-        netto  = float(row.get('z1WartNettoZRabf1', '0') or 0)
-        vat    = float(row.get('z1WartVatZRabf1', '0') or 0)
-        brutto = float(row.get('z1WartBruttoZRabf1', '0') or 0)
-        if stawka not in vat_groups:
-            vat_groups[stawka] = {'netto': 0.0, 'vat': 0.0, 'brutto': 0.0}
-        vat_groups[stawka]['netto']  += netto
-        vat_groups[stawka]['vat']    += vat
-        vat_groups[stawka]['brutto'] += brutto
+    for vr in d.get('vat_rows', []):
+        # Wyciągnij stawkę z nazwy, np. "Podstawowy podatek VAT 23%" → "23"
+        nazwa_stawki = vr.get('z1VNazwaStawkif1', '')
+        m = re.search(r'(\d+)\s*%', nazwa_stawki)
+        stawka = m.group(1) if m else '23'
+        netto  = float(vr.get('z1VObrotNettof1', '0') or 0)
+        vat_kw = float(vr.get('z1VKwotaVATf1', '0') or 0)
+        brutto = float(vr.get('z1VObrotBruttof1', '0') or 0)
+        vat_groups[stawka] = {'netto': netto, 'vat': vat_kw, 'brutto': brutto}
+
+    # Fallback: jeśli brak vat_rows, oblicz z pozycji
+    if not vat_groups:
+        for row in d['items']:
+            stawka = row.get('z1StawkaVATf1', '23').replace('%', '').strip()
+            netto  = float(row.get('z1WartNettoZRabf1', '0') or 0)
+            vat    = float(row.get('z1WartVatZRabf1', '0') or 0)
+            brutto = float(row.get('z1WartBruttoZRabf1', '0') or 0)
+            if stawka not in vat_groups:
+                vat_groups[stawka] = {'netto': 0.0, 'vat': 0.0, 'brutto': 0.0}
+            vat_groups[stawka]['netto']  += netto
+            vat_groups[stawka]['vat']    += vat
+            vat_groups[stawka]['brutto'] += brutto
 
     total_netto  = _fmt(d['total_netto'])
     total_vat    = _fmt(d['total_vat'])
@@ -1434,10 +1578,10 @@ def build_fa3_xml(d: dict) -> str:
             kwoty_xml += f"\n    <P_14_{suffix[1]}>{_fmt(vals['vat'])}</P_14_{suffix[1]}>"
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Faktura xmlns="http://crd.gov.pl/wzor/2024/11/25/19456/"
+<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Naglowek>
-    <KodFormularza kodSystemowy="FA(3)" wersjaSchemy="1-0E">FA</KodFormularza>
+    <KodFormularza kodSystemowy="FA (3)" wersjaSchemy="1-0E">FA</KodFormularza>
     <WariantFormularza>3</WariantFormularza>
     <DataWytworzeniaFa>{now_iso}</DataWytworzeniaFa>
     <SystemInfo>KSeF Desktop – Konwerter Crystal Reports</SystemInfo>
@@ -1445,7 +1589,7 @@ def build_fa3_xml(d: dict) -> str:
   <Podmiot1>
     <DaneIdentyfikacyjne>
       <NIP>{sp['nip']}</NIP>
-      <PelnaNazwa>{sp_nazwa}</PelnaNazwa>
+      <Nazwa>{sp_nazwa}</Nazwa>
     </DaneIdentyfikacyjne>
     <Adres>
       <KodKraju>PL</KodKraju>
@@ -1456,7 +1600,7 @@ def build_fa3_xml(d: dict) -> str:
   <Podmiot2>
     <DaneIdentyfikacyjne>
       <NIP>{nab['nip']}</NIP>
-      <PelnaNazwa>{nab_nazwa}</PelnaNazwa>
+      <Nazwa>{nab_nazwa}</Nazwa>
     </DaneIdentyfikacyjne>
     <Adres>
       <KodKraju>PL</KodKraju>
@@ -1500,7 +1644,7 @@ class ConvertTab(tk.Frame):
         wrap = tk.Frame(self, bg=COLOR_BG)
         wrap.pack(fill="both", expand=True, padx=24, pady=24)
 
-        tk.Label(wrap, text="🔄  Konwerter faktur → KSeF FA(3)",
+        tk.Label(wrap, text="  Konwerter faktur → KSeF FA(3)",
                  font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0,4))
         tk.Label(wrap, text="Wczytaj XML z Crystal Reports / systemu sprzedaży i konwertuj do FA(3)",
                  font=FONT_SMALL, bg=COLOR_BG, fg=COLOR_MUTED).pack(anchor="w", pady=(0,12))
@@ -1514,7 +1658,7 @@ class ConvertTab(tk.Frame):
         self.file_lbl = tk.Label(file_row, text="Brak wybranego pliku",
                                  font=FONT_BODY, bg=COLOR_CARD, fg=COLOR_MUTED, anchor="w")
         self.file_lbl.pack(side="left", fill="x", expand=True)
-        self._btn("📂  Wybierz XML", self._pick, COLOR_ACCENT, file_row).pack(side="right")
+        self._btn("  Wybierz XML", self._pick, COLOR_ACCENT, file_row).pack(side="right")
 
         # ── Podgląd wyodrębnionych danych ────────────────────────────────────
         pane = tk.PanedWindow(wrap, orient="horizontal", bg=COLOR_BG,
@@ -1524,7 +1668,7 @@ class ConvertTab(tk.Frame):
         # Lewa – dane faktury
         left = tk.Frame(pane, bg=COLOR_BG)
         pane.add(left, minsize=320)
-        tk.Label(left, text="📋  Dane wejściowe", font=("Segoe UI",11,"bold"),
+        tk.Label(left, text="  Dane wejściowe", font=("Segoe UI",11,"bold"),
                  bg=COLOR_BG, fg=COLOR_ACCENT).pack(anchor="w", pady=(0,4))
         self.info_box = scrolledtext.ScrolledText(
             left, font=FONT_MONO, bg="#0a0d14", fg=COLOR_TEXT,
@@ -1534,7 +1678,7 @@ class ConvertTab(tk.Frame):
         # Prawa – wygenerowany FA(3)
         right = tk.Frame(pane, bg=COLOR_BG)
         pane.add(right, minsize=380)
-        tk.Label(right, text="📄  Wygenerowany FA(3) XML", font=("Segoe UI",11,"bold"),
+        tk.Label(right, text="  Wygenerowany FA(3) XML", font=("Segoe UI",11,"bold"),
                  bg=COLOR_BG, fg=COLOR_ACCENT).pack(anchor="w", pady=(0,4))
         self.xml_box = scrolledtext.ScrolledText(
             right, font=FONT_MONO, bg="#0a0d14", fg=COLOR_TEXT,
@@ -1544,9 +1688,9 @@ class ConvertTab(tk.Frame):
         # ── Przyciski akcji ──────────────────────────────────────────────────
         btn_row = tk.Frame(wrap, bg=COLOR_BG)
         btn_row.pack(fill="x", pady=(10,0))
-        self._btn("🔄  Konwertuj", self._convert, COLOR_ACCENT,  btn_row).pack(side="left")
-        self._btn("📤  Wyślij do KSeF", self._to_send, "#2e6b2e", btn_row).pack(side="left", padx=8)
-        self._btn("💾  Zapisz FA(3).xml", self._save,  COLOR_ACCENT2, btn_row).pack(side="left")
+        self._btn("  Konwertuj", self._convert, COLOR_ACCENT,  btn_row).pack(side="left")
+        self._btn("  Wyślij do KSeF", self._to_send, "#2e6b2e", btn_row).pack(side="left", padx=8)
+        self._btn("  Zapisz FA(3).xml", self._save,  COLOR_ACCENT2, btn_row).pack(side="left")
         self.status_lbl = tk.Label(btn_row, text="", font=FONT_SMALL,
                                    bg=COLOR_BG, fg=COLOR_MUTED)
         self.status_lbl.pack(side="right", padx=8)
@@ -1565,7 +1709,12 @@ class ConvertTab(tk.Frame):
     @staticmethod
     def _dk(h):
         c = h.lstrip('#')
-        r,g,b = int(c[0:2],16),int(c[2:4],16),int(c[4:6],16)
+        if len(c) != 6:
+            return h
+        try:
+            r,g,b = int(c[0:2],16),int(c[2:4],16),int(c[4:6],16)
+        except ValueError:
+            return h
         return "#{:02x}{:02x}{:02x}".format(max(r-30,0),max(g-30,0),max(b-30,0))
 
     def _set_info(self, txt):
@@ -1703,7 +1852,7 @@ class App(tk.Tk):
         title_bar = tk.Frame(self, bg=COLOR_PANEL, height=50)
         title_bar.pack(fill="x", side="top")
         title_bar.pack_propagate(False)
-        tk.Label(title_bar, text="  🧾 KSeF Desktop",
+        tk.Label(title_bar, text="   KSeF Desktop",
                  font=("Segoe UI", 13, "bold"), bg=COLOR_PANEL,
                  fg=COLOR_ACCENT).pack(side="left", padx=12, pady=10)
         tk.Label(title_bar, text="Krajowy System e-Faktur",
