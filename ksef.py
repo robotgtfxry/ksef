@@ -642,7 +642,6 @@ class DashboardTab(tk.Frame):
         row.pack(padx=16, pady=12)
         btns = [
             ("  Wyślij fakturę", self._goto_send,  COLOR_ACCENT),
-            ("  Konwerter CR→FA(3)", self._goto_conv, "#2e5070"),
             ("  Pobierz faktury", self._goto_recv, COLOR_ACCENT2),
             ("  Sprawdź status", self._goto_status, "#2e7d52"),
             ("  Sesja", self._goto_auth, "#7d4e2e"),
@@ -685,7 +684,6 @@ class DashboardTab(tk.Frame):
                     lbl.config(fg=COLOR_SUCCESS if v == "OK" else COLOR_ERROR)
 
     def _goto_send(self):   self.app.show_tab("Wyślij")
-    def _goto_conv(self):   self.app.show_tab("Konwerter")
     def _goto_recv(self):   self.app.show_tab("Odebrane")
     def _goto_status(self): self.app.show_tab("Status")
     def _goto_auth(self):   self.app.show_tab("Sesja")
@@ -868,6 +866,8 @@ class SendTab(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, bg=COLOR_BG)
         self.app = app
+        self._crystal_raw = None   # surowy XML Crystal Reports
+        self._fa3_xml = None       # skonwertowany FA(3)
         self._build()
 
     def _build(self):
@@ -877,7 +877,7 @@ class SendTab(tk.Frame):
                  bg=COLOR_BG, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 16))
 
         # Wybór pliku
-        file_card = Card(wrap, title="Plik XML faktury")
+        file_card = Card(wrap, title="Plik XML faktury (Crystal Reports lub FA(3))")
         file_card.pack(fill="x", pady=(0, 10))
         row = tk.Frame(file_card.body, bg=COLOR_CARD)
         row.pack(padx=16, pady=10, fill="x")
@@ -886,23 +886,39 @@ class SendTab(tk.Frame):
                  bg=COLOR_CARD, fg=COLOR_MUTED, anchor="w").pack(side="left", fill="x", expand=True)
         FlatButton(row, "  Wybierz plik", self._pick_file, color="#444").pack(side="right")
 
-        # Podgląd XML
-        prev_card = Card(wrap, title="Podgląd treści XML")
-        prev_card.pack(fill="both", expand=True, pady=(0, 10))
+        # ── Panele podglądu ─────────────────────────────────────────────────
+        pane = tk.PanedWindow(wrap, orient="horizontal", bg=COLOR_BG,
+                              sashwidth=6, sashrelief="flat")
+        pane.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Lewa – podgląd danych faktury
+        left = tk.Frame(pane, bg=COLOR_BG)
+        pane.add(left, minsize=300)
+        tk.Label(left, text="  Dane faktury", font=("Segoe UI",11,"bold"),
+                 bg=COLOR_BG, fg=COLOR_ACCENT).pack(anchor="w", pady=(0,4))
+        self.invoice_info = scrolledtext.ScrolledText(
+            left, font=FONT_MONO, bg="#0a0d14", fg=COLOR_TEXT,
+            relief="flat", bd=0, state="disabled", wrap="word", height=12)
+        self.invoice_info.pack(fill="both", expand=True)
+
+        # Prawa – podgląd XML
+        right = tk.Frame(pane, bg=COLOR_BG)
+        pane.add(right, minsize=380)
+        tk.Label(right, text="  XML do wysłania", font=("Segoe UI",11,"bold"),
+                 bg=COLOR_BG, fg=COLOR_ACCENT).pack(anchor="w", pady=(0,4))
         self.xml_view = scrolledtext.ScrolledText(
-            prev_card.body, font=FONT_MONO, bg="#0a0d14", fg=COLOR_TEXT,
+            right, font=FONT_MONO, bg="#0a0d14", fg=COLOR_TEXT,
             insertbackground=COLOR_ACCENT, relief="flat", bd=0, wrap="none",
             height=12
         )
-        self.xml_view.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        FlatButton(prev_card.body, "  Wstaw przykładową FA(3) – KSeF 2.0",
-                   self._insert_sample, color="#2e5050").pack(anchor="w", padx=12, pady=(0, 10))
+        self.xml_view.pack(fill="both", expand=True)
 
         # Akcje
         action_row = tk.Frame(wrap, bg=COLOR_BG)
         action_row.pack(fill="x", pady=4)
         FlatButton(action_row, "  Waliduj XML", self._validate, "#2e6b2e").pack(side="left")
         FlatButton(action_row, "  Wyślij do KSeF", self._send, COLOR_ACCENT).pack(side="left", padx=8)
+        FlatButton(action_row, "  Wstaw przykładową FA(3)", self._insert_sample, "#2e5050").pack(side="left", padx=8)
         FlatButton(action_row, "  Wyczyść", self._clear, "#444").pack(side="left")
 
         # Wynik
@@ -910,6 +926,56 @@ class SendTab(tk.Frame):
         res_card.pack(fill="x", pady=(8, 0))
         self.result_log = LogBox(res_card.body)
         self.result_log.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+    def _set_invoice_info(self, txt):
+        self.invoice_info.config(state="normal")
+        self.invoice_info.delete("1.0", "end")
+        self.invoice_info.insert("end", txt)
+        self.invoice_info.config(state="disabled")
+
+    def _try_convert_crystal(self, xml_content):
+        """Próbuje rozpoznać XML Crystal Reports i skonwertować do FA(3).
+        Zwraca (fa3_xml, info_text) lub None jeśli to nie Crystal Reports."""
+        try:
+            d = parse_crystal_xml(xml_content)
+            fa3 = build_fa3_xml(d)
+
+            sp  = d['sprzedawca']
+            nab = d['nabywca']
+            info = (
+                f"FAKTURA  {d['nr']}\n"
+                f"{'─'*44}\n"
+                f"Data wystawienia:  {d['data_wystawienia']}\n"
+                f"Data dostawy:      {d['data_dostawy']}\n\n"
+                f"SPRZEDAWCA\n"
+                f"  {sp['nazwa']}\n"
+                f"  NIP: {sp['nip']}\n"
+                f"  {sp['l1']}, {sp['l2']}\n\n"
+                f"NABYWCA\n"
+                f"  {nab['nazwa']}\n"
+                f"  NIP: {nab['nip']}\n"
+                f"  {nab['l1']}, {nab['l2']}\n\n"
+                f"POZYCJE ({len(d['items'])})\n"
+                f"{'─'*44}\n"
+            )
+            for i, row in enumerate(d['items'], 1):
+                info += (
+                    f"  {i}. {row.get('z1NazwaLubOpisf1','').strip()}\n"
+                    f"     {row.get('z1Iloscf1','')} {row.get('z1Jmf1','')}  "
+                    f"× {row.get('z1CenaNBzRabf1','')} zł  |  VAT {row.get('z1StawkaVATf1','')}%\n"
+                    f"     Netto: {row.get('z1WartNettoZRabf1','')}  "
+                    f"VAT: {row.get('z1WartVatZRabf1','')}  "
+                    f"Brutto: {row.get('z1WartBruttoZRabf1','')}\n"
+                )
+            info += (
+                f"\n{'─'*44}\n"
+                f"  Razem netto:   {d['total_netto']} PLN\n"
+                f"  Razem VAT:     {d['total_vat']} PLN\n"
+                f"  Razem brutto:  {d['total_brutto']} PLN\n"
+            )
+            return fa3, info
+        except Exception:
+            return None
 
     def _pick_file(self):
         path = filedialog.askopenfilename(
@@ -921,8 +987,25 @@ class SendTab(tk.Frame):
             try:
                 with open(path, encoding="utf-8") as f:
                     content = f.read()
-                self.xml_view.delete("1.0", "end")
-                self.xml_view.insert("end", content)
+
+                # Próbuj automatycznie skonwertować Crystal Reports → FA(3)
+                result = self._try_convert_crystal(content)
+                if result:
+                    fa3, info = result
+                    self._crystal_raw = content
+                    self._fa3_xml = fa3
+                    self.xml_view.delete("1.0", "end")
+                    self.xml_view.insert("end", fa3)
+                    self._set_invoice_info(info)
+                    self.result_log.log(f"Automatyczna konwersja Crystal Reports → FA(3) ✔", "ok")
+                    self.app.dashboard.log.log(f"Wczytano i skonwertowano: {os.path.basename(path)}", "ok")
+                else:
+                    # Zwykły XML (prawdopodobnie już FA(3))
+                    self._crystal_raw = None
+                    self._fa3_xml = None
+                    self.xml_view.delete("1.0", "end")
+                    self.xml_view.insert("end", content)
+                    self._set_invoice_info("Wczytano gotowy XML.\nJeśli to FA(3), możesz go wysłać bezpośrednio.")
             except Exception as ex:
                 messagebox.showerror("Błąd odczytu", str(ex))
 
@@ -949,6 +1032,18 @@ class SendTab(tk.Frame):
         if not xml_content:
             messagebox.showwarning("Brak danych", "Wpisz lub wczytaj treść faktury XML.")
             return
+
+        # Automatyczna konwersja Crystal Reports → FA(3) jeśli potrzeba
+        result = self._try_convert_crystal(xml_content)
+        if result:
+            fa3, info = result
+            self._fa3_xml = fa3
+            self.xml_view.delete("1.0", "end")
+            self.xml_view.insert("end", fa3)
+            self._set_invoice_info(info)
+            xml_content = fa3
+            self.result_log.log("Automatyczna konwersja Crystal Reports → FA(3) ✔", "ok")
+
         try:
             ET.fromstring(xml_content)
         except ET.ParseError as ex:
@@ -1886,13 +1981,13 @@ class App(tk.Tk):
         self._tabs["Pulpit"]  = self.dashboard
         self._tabs["Sesja"]   = SessionTab(self._content, self)
         self._tabs["Wyślij"]  = SendTab(self._content, self)
-        self._tabs["Konwerter"] = ConvertTab(self._content, self)
+        # Konwerter usunięty – konwersja odbywa się automatycznie w zakładce Wyślij
         self._tabs["Odebrane"]= ReceiveTab(self._content, self)
         self._tabs["Status"]  = StatusTab(self._content, self)
         self._tabs["Ustawienia"] = SettingsTab(self._content, self)
 
         icons = {"Pulpit": "🏠", "Sesja": "🔐", "Wyślij": "📤",
-                 "Konwerter": "🔄", "Odebrane": "📥", "Status": "🔍", "Ustawienia": "⚙"}
+                 "Odebrane": "📥", "Status": "🔍", "Ustawienia": "⚙"}
 
         tk.Frame(sidebar, bg=COLOR_BORDER, height=1).pack(fill="x", pady=(16, 8))
 
