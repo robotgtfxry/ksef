@@ -30,6 +30,17 @@ try:
 except ImportError:
     HAS_CRYPTO = False
 
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as _rl_canvas
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib import colors as _rl_colors
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
+
 # ── Stałe ────────────────────────────────────────────────────────────────────
 APP_NAME    = "KSeF Desktop"
 APP_VERSION = "1.0.0"
@@ -146,8 +157,8 @@ class KSeFClient:
             raise RuntimeError("Brak biblioteki 'requests'. Zainstaluj: pip install requests")
         headers = self._headers(extra_headers)
 
-        # Dla KSeF 2.0 - dodaj referencję sesji jeśli istnieje
-        if self.session_ref and "invoices" in path:
+        # Dla KSeF 2.0 - dodaj referencję sesji tylko dla endpointów sesyjnych
+        if self.session_ref and "/sessions/" in path:
             headers["X-KSEF-ReferenceNumber"] = self.session_ref
 
         if raw:
@@ -449,17 +460,54 @@ class KSeFClient:
         return self._get(f"/sessions/{self.session_ref}/invoices/{reference_no}")
 
     def query_invoices(self, date_from: str, date_to: str,
-                       subject_type: str = "subject1") -> dict:
-        """GET /sessions/{sessionRef}/invoices – wyszukiwanie faktur w sesji KSeF 2.0."""
-        if not self.session_ref:
-            raise RuntimeError("Brak aktywnej sesji KSeF.")
-        return self._get(f"/sessions/{self.session_ref}/invoices")
+                       subject_type: str = "Subject2",
+                       date_type: str = "Invoicing",
+                       page_size: int = 50, page_offset: int = 0) -> dict:
+        """POST /invoices/query/metadata – synchroniczne wyszukiwanie metadanych faktur (KSeF 2.0).
+
+        Nie wymaga otwartej sesji online – wystarczy aktywny JWT (accessToken).
+        Enumy PascalCase: subjectType ∈ {Subject1, Subject2, Subject3},
+        dateType ∈ {Invoicing, Issue, PermanentStorage}.
+        Odpowiedź: {"hasMore", "isTruncated", "invoices": [...]}.
+        """
+        if not self.access_token:
+            raise RuntimeError("Brak aktywnej sesji JWT. Zaloguj się tokenem KSeF.")
+        # Normalizacja – akceptuj też warianty z małej litery
+        st = subject_type[0].upper() + subject_type[1:] if subject_type else "Subject2"
+        dt = date_type[0].upper() + date_type[1:] if date_type else "Invoicing"
+        payload = {
+            "subjectType": st,
+            "dateRange": {
+                "dateType": dt,
+                "from": date_from,
+                "to": date_to,
+            },
+        }
+        path = f"/invoices/query/metadata?pageSize={page_size}&pageOffset={page_offset}"
+        # Auto-refresh JWT przy 401 (access token żyje tylko ~5 min)
+        try:
+            return self._post(path, payload)
+        except RuntimeError as e:
+            if "HTTP 401" in str(e) and self.refresh_token:
+                self.refresh_access_token()
+                return self._post(path, payload)
+            raise
 
     def download_invoice(self, ksef_ref: str) -> dict:
-        """GET /sessions/{sessionRef}/invoices/{ksefReferenceNumber} – pobranie faktury."""
-        if not self.session_ref:
-            raise RuntimeError("Brak aktywnej sesji KSeF.")
-        return self._get(f"/sessions/{self.session_ref}/invoices/{ksef_ref}")
+        """GET /invoices/ksef/{ksefReferenceNumber} – pobranie treści XML faktury (KSeF 2.0).
+
+        Zwraca surowy XML – pakujemy go w dict {'invoiceData': <base64>} dla
+        zgodności z kodem zapisującym plik.
+        """
+        if not HAS_REQUESTS:
+            raise RuntimeError("Brak biblioteki 'requests'. Zainstaluj: pip install requests")
+        if not self.access_token:
+            raise RuntimeError("Brak aktywnej sesji JWT. Zaloguj się tokenem KSeF.")
+        headers = self._headers({"Accept": "application/xml"})
+        r = requests.get(f"{self.base_url}/invoices/ksef/{ksef_ref}",
+                         headers=headers, timeout=60)
+        r.raise_for_status()
+        return {"invoiceData": base64.b64encode(r.content).decode("ascii")}
 
     def get_upo(self, reference_no: str) -> dict:
         """GET /sessions/{sessionRef}/invoices/{referenceNumber}/upo – pobranie UPO."""
@@ -1228,11 +1276,14 @@ class ReceiveTab(tk.Frame):
         self.date_to.insert(0, datetime.date.today().isoformat())
 
         labeled(fb, "Rola podmiotu:", 1)
-        self.role_var = tk.StringVar(value="subject1")
+        # Domyślnie "Nabywca" – w zakładce "Odebrane" chcemy widzieć faktury,
+        # na których użytkownik jest nabywcą (czyli faktycznie otrzymane).
+        self.role_var = tk.StringVar(value="Subject2")
         role_frame = tk.Frame(fb, bg=COLOR_CARD)
         role_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=(0, 16), pady=5)
-        for val, lbl in [("subject1", "Sprzedawca"), ("subject2", "Nabywca"),
-                         ("subject3", "Podmiot trzeci")]:
+        for val, lbl in [("Subject1", "Sprzedawca (wystawione)"),
+                         ("Subject2", "Nabywca (otrzymane)"),
+                         ("Subject3", "Podmiot trzeci")]:
             tk.Radiobutton(role_frame, text=lbl, variable=self.role_var, value=val,
                            bg=COLOR_CARD, fg=COLOR_TEXT, selectcolor=COLOR_BG,
                            activebackground=COLOR_CARD, font=FONT_BODY).pack(side="left", padx=8)
@@ -1240,8 +1291,10 @@ class ReceiveTab(tk.Frame):
         btn_row = tk.Frame(fb, bg=COLOR_CARD)
         btn_row.grid(row=2, column=0, columnspan=4, pady=10, padx=16, sticky="w")
         FlatButton(btn_row, "  Szukaj", self._search, COLOR_ACCENT).pack(side="left", padx=4)
-        FlatButton(btn_row, "  Pobierz zaznaczoną", self._download_selected,
+        FlatButton(btn_row, "  Pobierz XML", self._download_selected,
                    COLOR_ACCENT2).pack(side="left", padx=4)
+        FlatButton(btn_row, "  Pobierz PDF", self._download_selected_pdf,
+                   "#2e6b2e").pack(side="left", padx=4)
 
         # Lista wyników
         res_card = Card(wrap, title="Wyniki")
@@ -1292,21 +1345,52 @@ class ReceiveTab(tk.Frame):
         def _task():
             try:
                 result = self.app.client.query_invoices(
-                    f"{d_from}T00:00:00Z", f"{d_to}T23:59:59Z", role)
-                invoices = result.get("invoiceHeaderList", [])
+                    f"{d_from}T00:00:00+00:00", f"{d_to}T23:59:59+00:00", role)
+                # KSeF 2.0: lista w polu "invoices"
+                invoices = result.get("invoices") or result.get("invoiceHeaderList", [])
                 self.tree.delete(*self.tree.get_children())
                 for inv in invoices:
+                    seller = inv.get("seller") or inv.get("subjectBy") or {}
+                    buyer  = inv.get("buyer")  or inv.get("subjectTo") or {}
+                    inv_date = inv.get("invoicingDate") or inv.get("issueDate") or ""
+                    if isinstance(inv_date, str) and "T" in inv_date:
+                        inv_date = inv_date.split("T", 1)[0]
                     self.tree.insert("", "end", values=(
-                        inv.get("invoicingDate", ""),
-                        inv.get("invoiceReferenceNumber", ""),
-                        inv.get("subjectBy", {}).get("issuedByName", ""),
-                        inv.get("subjectTo", {}).get("issuedToName", ""),
-                        inv.get("gross", ""),
-                        inv.get("ksefReferenceNumber", ""),
+                        inv_date,
+                        inv.get("invoiceNumber", ""),
+                        seller.get("name") or seller.get("issuedByName", ""),
+                        buyer.get("name")  or buyer.get("issuedToName",  ""),
+                        inv.get("grossAmount", inv.get("gross", "")),
+                        inv.get("ksefNumber", inv.get("ksefReferenceNumber", "")),
                     ))
                 self.log.log(f"Znaleziono {len(invoices)} faktur.", "ok")
+                if len(invoices) == 0:
+                    # Diagnostyka – pokaż klucze z odpowiedzi żeby wyłapać
+                    # sytuację gdy API zwraca listę pod innym polem lub HWM.
+                    keys = list(result.keys()) if isinstance(result, dict) else []
+                    self.log.log(f"Klucze odpowiedzi: {keys}", "warn")
+                    self.log.log(
+                        f"hasMore={result.get('hasMore')} "
+                        f"isTruncated={result.get('isTruncated')} "
+                        f"HWM={result.get('permanentStorageHwmDate')}",
+                        "warn")
+                    # Podpowiedź gdy rola jest Subject1 a użytkownik szuka odebranych
+                    if role == "Subject1":
+                        self.log.log(
+                            "Szukasz jako Sprzedawca – jeśli chcesz faktury OTRZYMANE, "
+                            "zmień rolę na 'Nabywca'.", "warn")
+                if result.get("hasMore"):
+                    self.log.log("Uwaga: jest więcej wyników (hasMore=true) – zawęź zakres dat.", "warn")
             except Exception as ex:
                 self.log.log(f"Błąd zapytania: {ex}", "error")
+                # Typowe przyczyny – podpowiedz użytkownikowi
+                msg = str(ex)
+                if "401" in msg:
+                    self.log.log("JWT wygasł (żyje ~5 min). Otwórz sesję ponownie w zakładce 'Sesja'.", "warn")
+                elif "403" in msg:
+                    self.log.log("Brak uprawnienia InvoiceRead – token KSeF musi mieć tę rolę.", "warn")
+                elif "400" in msg:
+                    self.log.log("Żądanie odrzucone – sprawdź format dat i rolę podmiotu.", "warn")
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1340,6 +1424,547 @@ class ReceiveTab(tk.Frame):
                 self.log.log(f"Błąd pobierania: {ex}", "error")
 
         threading.Thread(target=_task, daemon=True).start()
+
+    def _download_selected_pdf(self):
+        """Pobiera zaznaczoną fakturę z KSeF, parsuje FA(3) i generuje PDF."""
+        if not HAS_REPORTLAB:
+            messagebox.showerror(
+                "Brak biblioteki",
+                "Do generowania PDF wymagany jest pakiet 'reportlab'.\n\n"
+                "Zainstaluj: pip install reportlab")
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Zaznacz fakturę w tabeli.")
+            return
+        item = self.tree.item(sel[0])
+        ksef_ref = item["values"][5]
+        if not ksef_ref:
+            messagebox.showwarning("Brak ref.", "Brak numeru KSeF dla zaznaczonej faktury.")
+            return
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+            initialfile=f"faktura_{ksef_ref[:20]}.pdf"
+        )
+        if not save_path:
+            return
+
+        def _task():
+            try:
+                result = self.app.client.download_invoice(ksef_ref)
+                xml_b64 = result.get("invoiceData", "")
+                xml_bytes = base64.b64decode(xml_b64)
+                data = parse_fa3_xml(xml_bytes)
+                render_invoice_pdf(data, save_path, ksef_number=ksef_ref)
+                self.log.log(f"Zapisano PDF: {save_path}", "ok")
+            except Exception as ex:
+                self.log.log(f"Błąd generowania PDF: {ex}", "error")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PARSER FA(3) XML + RENDER PDF
+# ════════════════════════════════════════════════════════════════════════════
+FA3_NS = "http://crd.gov.pl/wzor/2025/06/25/13775/"
+
+
+def _fa3_text(elem, path, default=""):
+    """Zwraca tekst elementu po ścieżce z przestrzenią nazw FA(3)."""
+    if elem is None:
+        return default
+    ns_path = "/".join(f"{{{FA3_NS}}}{p}" for p in path.split("/"))
+    found = elem.find(ns_path)
+    return (found.text or default).strip() if found is not None and found.text else default
+
+
+def parse_fa3_xml(xml_bytes: bytes) -> dict:
+    """Parsuje FA(3) XML i zwraca strukturę używaną przez render_invoice_pdf."""
+    root = ET.fromstring(xml_bytes)
+    ns = {"fa": FA3_NS}
+
+    def t(parent, path, default=""):
+        if parent is None:
+            return default
+        el = parent.find(path, ns)
+        return (el.text or default).strip() if el is not None and el.text else default
+
+    naglowek = root.find("fa:Naglowek", ns)
+    sp_el  = root.find("fa:Podmiot1", ns)
+    nab_el = root.find("fa:Podmiot2", ns)
+    fa_el  = root.find("fa:Fa", ns)
+
+    def _podmiot(el):
+        if el is None:
+            return {"nip": "", "nazwa": "", "l1": "", "l2": "", "kraj": ""}
+        return {
+            "nip":   t(el, "fa:DaneIdentyfikacyjne/fa:NIP"),
+            "nazwa": t(el, "fa:DaneIdentyfikacyjne/fa:Nazwa"),
+            "l1":    t(el, "fa:Adres/fa:AdresL1"),
+            "l2":    t(el, "fa:Adres/fa:AdresL2"),
+            "kraj":  t(el, "fa:Adres/fa:KodKraju"),
+        }
+
+    sprzedawca = _podmiot(sp_el)
+    nabywca    = _podmiot(nab_el)
+
+    items = []
+    if fa_el is not None:
+        for w in fa_el.findall("fa:FaWiersz", ns):
+            items.append({
+                "nr":      t(w, "fa:NrWierszaFa"),
+                "nazwa":   t(w, "fa:P_7"),
+                "jm":      t(w, "fa:P_8A"),
+                "ilosc":   t(w, "fa:P_8B"),
+                "cena":    t(w, "fa:P_9A"),
+                "cena_br": t(w, "fa:P_9B"),
+                "netto":   t(w, "fa:P_11"),
+                "brutto":  t(w, "fa:P_11A"),
+                "stawka":  t(w, "fa:P_12"),
+            })
+
+    # Sumy per stawka – odczytaj P_13_x / P_14_x jeśli obecne
+    stawki = []
+    if fa_el is not None:
+        # kolejność zgodna ze schematem
+        mapping = [
+            ("23% / 22%",  "fa:P_13_1",   "fa:P_14_1"),
+            ("8% / 7%",    "fa:P_13_2",   "fa:P_14_2"),
+            ("5% / 4%/3%", "fa:P_13_3",   "fa:P_14_3"),
+            ("taxi 4%",    "fa:P_13_4",   "fa:P_14_4"),
+            ("proc.sz.",   "fa:P_13_5",   "fa:P_14_5"),
+            ("0% (kraj)",  "fa:P_13_6_1", None),
+            ("0% (WDT)",   "fa:P_13_6_2", None),
+            ("0% (EX)",    "fa:P_13_6_3", None),
+            ("zw",         "fa:P_13_7",   None),
+            ("np (I)",     "fa:P_13_8",   None),
+            ("np (II)",    "fa:P_13_9",   None),
+            ("oo",         "fa:P_13_10",  None),
+            ("marża",      "fa:P_13_11",  None),
+        ]
+        for label, p13, p14 in mapping:
+            net = t(fa_el, p13)
+            vat = t(fa_el, p14) if p14 else ""
+            if net:
+                stawki.append({"label": label, "netto": net, "vat": vat})
+
+    # Płatność
+    platnosc = fa_el.find("fa:Platnosc", ns) if fa_el is not None else None
+    p_forma = t(platnosc, "fa:FormaPlatnosci") if platnosc is not None else ""
+    _forma_map = {
+        "1": "gotówka", "2": "karta", "3": "bon", "4": "czek",
+        "5": "weksel", "6": "przelew", "7": "mobilna",
+    }
+    forma_lbl = _forma_map.get(p_forma, p_forma)
+
+    rachunki = []
+    if platnosc is not None:
+        for r in platnosc.findall("fa:RachunekBankowy", ns):
+            rachunki.append({
+                "nr":   t(r, "fa:NrRB"),
+                "bank": t(r, "fa:NazwaBanku"),
+                "swift": t(r, "fa:SWIFT"),
+            })
+
+    # Adnotacje – wybrane pola
+    adn_el = fa_el.find("fa:Adnotacje", ns) if fa_el is not None else None
+    adnotacje_lines = []
+    if adn_el is not None:
+        mechanizm = t(adn_el, "fa:P_18A")
+        if mechanizm == "1":
+            adnotacje_lines.append("Mechanizm podzielonej płatności")
+        if t(adn_el, "fa:P_16") == "1":
+            adnotacje_lines.append("Metoda kasowa")
+        if t(adn_el, "fa:P_17") == "1":
+            adnotacje_lines.append("Samofakturowanie")
+        if t(adn_el, "fa:Zwolnienie/fa:P_19N") == "1":
+            adnotacje_lines.append("Zwolnienie z VAT")
+        if t(adn_el, "fa:NoweSrodkiTransportu/fa:P_22N") == "1":
+            adnotacje_lines.append("Nowe środki transportu")
+
+    return {
+        # Nagłówek
+        "wariant":          t(naglowek, "fa:KodFormularza") if naglowek is not None else "FA",
+        "system_info":      t(naglowek, "fa:SystemInfo") if naglowek is not None else "",
+        # Faktura
+        "nr":               t(fa_el, "fa:P_2"),
+        "data_wystawienia": t(fa_el, "fa:P_1"),
+        "miejsce_wyst":     t(fa_el, "fa:P_1M"),
+        "data_dostawy":     t(fa_el, "fa:P_6"),
+        "okres_od":         t(fa_el, "fa:OkresFa/fa:P_6_Od"),
+        "okres_do":         t(fa_el, "fa:OkresFa/fa:P_6_Do"),
+        "kod_waluty":       t(fa_el, "fa:KodWaluty", "PLN"),
+        "rodzaj":           t(fa_el, "fa:RodzajFaktury", "VAT"),
+        "total_brutto":     t(fa_el, "fa:P_15"),
+        "sprzedawca":       sprzedawca,
+        "nabywca":          nabywca,
+        "items":            items,
+        "stawki":           stawki,
+        "platnosc": {
+            "forma":    forma_lbl,
+            "termin":   t(platnosc, "fa:TerminPlatnosci/fa:Termin") if platnosc is not None else "",
+            "zaplacono": t(platnosc, "fa:Zaplacono") if platnosc is not None else "",
+            "rachunki": rachunki,
+        },
+        "adnotacje":        adnotacje_lines,
+    }
+
+
+def render_invoice_pdf(data: dict, out_path: str, ksef_number: str = "") -> None:
+    """Renderuje fakturę do PDF w stylu zbliżonym do wizualizacji KSeF MF.
+
+    Używa reportlab (canvas + ramki + tabele). Rejestruje DejaVuSans / Arial
+    z czcionek Windows dla poprawnego renderowania polskich znaków."""
+    if not HAS_REPORTLAB:
+        raise RuntimeError("Brak pakietu reportlab")
+
+    # ── Czcionki ────────────────────────────────────────────────────────────
+    font_name = "Helvetica"
+    font_bold = "Helvetica-Bold"
+    for reg, bold in (
+        (r"C:\Windows\Fonts\DejaVuSans.ttf",  r"C:\Windows\Fonts\DejaVuSans-Bold.ttf"),
+        (r"C:\Windows\Fonts\arial.ttf",       r"C:\Windows\Fonts\arialbd.ttf"),
+    ):
+        if os.path.exists(reg):
+            try:
+                pdfmetrics.registerFont(TTFont("InvFont", reg))
+                font_name = "InvFont"
+                if os.path.exists(bold):
+                    pdfmetrics.registerFont(TTFont("InvFontBold", bold))
+                    font_bold = "InvFontBold"
+                else:
+                    font_bold = "InvFont"
+                break
+            except Exception:
+                pass
+
+    # ── Kolory jak w wizualizacji MF ────────────────────────────────────────
+    COL_HEADER_BG = _rl_colors.HexColor("#0b5394")   # granatowy pasek MF
+    COL_BOX_BG    = _rl_colors.HexColor("#f2f4f8")
+    COL_BORDER    = _rl_colors.HexColor("#b6bcc8")
+    COL_TABLE_HDR = _rl_colors.HexColor("#e4e9f2")
+    COL_TEXT      = _rl_colors.HexColor("#1a1a1a")
+    COL_MUTED     = _rl_colors.HexColor("#5b6473")
+
+    c = _rl_canvas.Canvas(out_path, pagesize=A4)
+    W, H = A4
+    LM = 15 * mm   # left margin
+    RM = 15 * mm   # right margin
+    CW = W - LM - RM
+
+    # ── Helpery ─────────────────────────────────────────────────────────────
+    def _wrap(text, font, size, max_w):
+        if not text:
+            return [""]
+        words = str(text).split()
+        lines, cur = [], ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            if pdfmetrics.stringWidth(trial, font, size) <= max_w:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines or [""]
+
+    def _box(x, y, w, h, fill=None, stroke=COL_BORDER, lw=0.6):
+        c.setLineWidth(lw)
+        c.setStrokeColor(stroke)
+        if fill is not None:
+            c.setFillColor(fill)
+            c.rect(x, y, w, h, stroke=1, fill=1)
+        else:
+            c.rect(x, y, w, h, stroke=1, fill=0)
+        c.setFillColor(COL_TEXT)
+
+    def _text(x, y, s, font=font_name, size=9, color=COL_TEXT):
+        c.setFont(font, size)
+        c.setFillColor(color)
+        c.drawString(x, y, str(s) if s is not None else "")
+
+    def _rtext(x, y, s, font=font_name, size=9, color=COL_TEXT):
+        c.setFont(font, size)
+        c.setFillColor(color)
+        c.drawRightString(x, y, str(s) if s is not None else "")
+
+    # ── Pasek nagłówka (granatowy) ──────────────────────────────────────────
+    y = H - 15 * mm
+    hdr_h = 18 * mm
+    c.setFillColor(COL_HEADER_BG)
+    c.rect(LM, y - hdr_h, CW, hdr_h, stroke=0, fill=1)
+
+    c.setFillColor(_rl_colors.white)
+    c.setFont(font_bold, 15)
+    rodzaj = data.get("rodzaj", "VAT")
+    rodzaj_lbl = {
+        "VAT": "FAKTURA", "KOR": "FAKTURA KORYGUJĄCA",
+        "ZAL": "FAKTURA ZALICZKOWA", "ROZ": "FAKTURA ROZLICZENIOWA",
+        "UPR": "FAKTURA UPROSZCZONA",
+    }.get(rodzaj, f"FAKTURA {rodzaj}")
+    c.drawString(LM + 5 * mm, y - 8 * mm, rodzaj_lbl)
+    c.setFont(font_bold, 11)
+    c.drawString(LM + 5 * mm, y - 14 * mm, f"Nr {data.get('nr', '')}")
+
+    c.setFont(font_name, 8)
+    if ksef_number:
+        c.drawRightString(LM + CW - 5 * mm, y - 6 * mm, "Numer KSeF:")
+        c.setFont(font_bold, 9)
+        c.drawRightString(LM + CW - 5 * mm, y - 10 * mm, ksef_number)
+    c.setFont(font_name, 7)
+    c.drawRightString(LM + CW - 5 * mm, y - 15 * mm,
+                      f"Wariant: {data.get('wariant', 'FA')}")
+
+    y = y - hdr_h - 4 * mm
+
+    # ── Pasek dat ──────────────────────────────────────────────────────────
+    info_h = 10 * mm
+    _box(LM, y - info_h, CW, info_h, fill=COL_BOX_BG)
+    col_w = CW / 3
+    labels = [
+        ("Data wystawienia", data.get("data_wystawienia", "")),
+        ("Data dostawy / wykonania usługi",
+            data.get("data_dostawy") or
+            (f"{data['okres_od']} – {data['okres_do']}" if data.get("okres_od") else "")),
+        ("Miejsce wystawienia", data.get("miejsce_wyst", "")),
+    ]
+    for i, (lbl, val) in enumerate(labels):
+        cx = LM + i * col_w + 3 * mm
+        _text(cx, y - 4 * mm, lbl, font=font_name, size=7, color=COL_MUTED)
+        _text(cx, y - 8 * mm, val or "—", font=font_bold, size=9)
+    y -= info_h + 4 * mm
+
+    # ── Sprzedawca / Nabywca (dwa pudełka obok siebie) ─────────────────────
+    box_h = 34 * mm
+    bw = (CW - 4 * mm) / 2
+    sp = data["sprzedawca"]
+    nab = data["nabywca"]
+
+    def _draw_party(bx, by, bw, bh, title, p):
+        _box(bx, by - bh, bw, bh, fill=_rl_colors.white)
+        # pasek tytułu
+        c.setFillColor(COL_TABLE_HDR)
+        c.rect(bx, by - 5 * mm, bw, 5 * mm, stroke=0, fill=1)
+        c.setStrokeColor(COL_BORDER)
+        c.setLineWidth(0.6)
+        c.rect(bx, by - 5 * mm, bw, 5 * mm, stroke=1, fill=0)
+        _text(bx + 2 * mm, by - 3.6 * mm, title, font=font_bold, size=8)
+
+        ty = by - 9 * mm
+        _text(bx + 2 * mm, ty, p.get("nazwa", ""), font=font_bold, size=9)
+        ty -= 4.5 * mm
+        nip = p.get("nip", "")
+        if nip:
+            _text(bx + 2 * mm, ty, f"NIP: {nip}", font=font_name, size=9)
+            ty -= 4.5 * mm
+        for ln in _wrap(p.get("l1", ""), font_name, 8, bw - 4 * mm):
+            _text(bx + 2 * mm, ty, ln, font=font_name, size=8)
+            ty -= 4 * mm
+        for ln in _wrap(p.get("l2", ""), font_name, 8, bw - 4 * mm):
+            _text(bx + 2 * mm, ty, ln, font=font_name, size=8)
+            ty -= 4 * mm
+        if p.get("kraj"):
+            _text(bx + 2 * mm, ty, f"Kraj: {p['kraj']}",
+                  font=font_name, size=8, color=COL_MUTED)
+
+    _draw_party(LM, y, bw, box_h, "SPRZEDAWCA", sp)
+    _draw_party(LM + bw + 4 * mm, y, bw, box_h, "NABYWCA", nab)
+    y -= box_h + 5 * mm
+
+    # ── Tabela pozycji ──────────────────────────────────────────────────────
+    # Kolumny: Lp | Nazwa | Jm | Ilość | Cena netto | Wart. netto | VAT % | Wart. brutto
+    col_defs = [
+        ("Lp.",           8 * mm,  "l"),
+        ("Nazwa towaru / usługi", None, "l"),  # rozciągnięta
+        ("Jm",            10 * mm, "c"),
+        ("Ilość",         16 * mm, "r"),
+        ("Cena netto",    20 * mm, "r"),
+        ("Wart. netto",   22 * mm, "r"),
+        ("VAT",           12 * mm, "c"),
+        ("Wart. brutto",  22 * mm, "r"),
+    ]
+    fixed = sum(w for _, w, _ in col_defs if w is not None)
+    stretch_w = CW - fixed
+    cols = []
+    cx = LM
+    for name, w, align in col_defs:
+        ww = stretch_w if w is None else w
+        cols.append({"name": name, "x": cx, "w": ww, "align": align})
+        cx += ww
+
+    def _draw_items_header(yy):
+        c.setFillColor(COL_TABLE_HDR)
+        c.rect(LM, yy - 6 * mm, CW, 6 * mm, stroke=0, fill=1)
+        c.setStrokeColor(COL_BORDER)
+        c.setLineWidth(0.6)
+        c.rect(LM, yy - 6 * mm, CW, 6 * mm, stroke=1, fill=0)
+        for col in cols:
+            tx = col["x"] + col["w"] / 2
+            c.setFont(font_bold, 7.5)
+            c.setFillColor(COL_TEXT)
+            c.drawCentredString(tx, yy - 4 * mm, col["name"])
+        return yy - 6 * mm
+
+    y = _draw_items_header(y)
+
+    def _draw_row(yy, it, alt):
+        # oblicz wysokość wiersza na podstawie zawijania nazwy
+        name_col = cols[1]
+        name_lines = _wrap(it.get("nazwa", ""), font_name, 8, name_col["w"] - 2 * mm)
+        row_h = max(5 * mm, 3 * mm + len(name_lines) * 3.6 * mm)
+
+        if alt:
+            c.setFillColor(COL_BOX_BG)
+            c.rect(LM, yy - row_h, CW, row_h, stroke=0, fill=1)
+        # ramka
+        c.setStrokeColor(COL_BORDER)
+        c.setLineWidth(0.3)
+        c.rect(LM, yy - row_h, CW, row_h, stroke=1, fill=0)
+        # linie pionowe
+        for col in cols[1:]:
+            c.line(col["x"], yy, col["x"], yy - row_h)
+
+        vals = [
+            it.get("nr", ""),
+            None,  # nazwa rysowana osobno (wielolinijkowa)
+            it.get("jm", ""),
+            it.get("ilosc", ""),
+            it.get("cena", ""),
+            it.get("netto", ""),
+            it.get("stawka", ""),
+            it.get("brutto", ""),
+        ]
+        text_y = yy - 4 * mm
+        for col, v in zip(cols, vals):
+            if v is None:
+                continue
+            c.setFont(font_name, 8)
+            c.setFillColor(COL_TEXT)
+            if col["align"] == "r":
+                c.drawRightString(col["x"] + col["w"] - 1.5 * mm, text_y, str(v))
+            elif col["align"] == "c":
+                c.drawCentredString(col["x"] + col["w"] / 2, text_y, str(v))
+            else:
+                c.drawString(col["x"] + 1.5 * mm, text_y, str(v))
+        # nazwa (wielolinijkowa)
+        ly = yy - 4 * mm
+        for ln in name_lines:
+            c.setFont(font_name, 8)
+            c.drawString(name_col["x"] + 1.5 * mm, ly, ln)
+            ly -= 3.6 * mm
+
+        return yy - row_h
+
+    items = data.get("items", [])
+    for i, it in enumerate(items):
+        if y < 60 * mm:
+            c.showPage()
+            y = H - 20 * mm
+            y = _draw_items_header(y)
+        y = _draw_row(y, it, alt=(i % 2 == 1))
+
+    y -= 6 * mm
+
+    # ── Podsumowanie VAT (prawa strona) + płatność (lewa strona) ───────────
+    left_x  = LM
+    right_x = LM + CW / 2 + 2 * mm
+    box_top = y
+
+    # VAT
+    if data.get("stawki"):
+        vat_h = 8 * mm + len(data["stawki"]) * 5 * mm
+        _box(right_x, y - vat_h, CW / 2 - 2 * mm, vat_h, fill=_rl_colors.white)
+        # nagłówek
+        c.setFillColor(COL_TABLE_HDR)
+        c.rect(right_x, y - 5 * mm, CW / 2 - 2 * mm, 5 * mm, stroke=0, fill=1)
+        c.setStrokeColor(COL_BORDER)
+        c.rect(right_x, y - 5 * mm, CW / 2 - 2 * mm, 5 * mm, stroke=1, fill=0)
+        _text(right_x + 2 * mm, y - 3.6 * mm, "ROZLICZENIE VAT", font=font_bold, size=8)
+        # nagłówek kolumn
+        hy = y - 8 * mm
+        c.setFont(font_bold, 7)
+        c.setFillColor(COL_MUTED)
+        c.drawString(right_x + 2 * mm, hy, "Stawka")
+        c.drawRightString(right_x + CW / 2 * 0.55, hy, "Netto")
+        c.drawRightString(right_x + CW / 2 - 3 * mm, hy, "VAT")
+        ry = hy - 4 * mm
+        for s in data["stawki"]:
+            c.setFont(font_name, 8)
+            c.setFillColor(COL_TEXT)
+            c.drawString(right_x + 2 * mm, ry, s["label"])
+            c.drawRightString(right_x + CW / 2 * 0.55, ry, s["netto"] or "—")
+            c.drawRightString(right_x + CW / 2 - 3 * mm, ry, s["vat"] or "—")
+            ry -= 5 * mm
+        y_vat_bottom = y - vat_h
+    else:
+        y_vat_bottom = y
+
+    # Płatność
+    plat = data.get("platnosc", {})
+    info_lines = []
+    if plat.get("forma"):
+        info_lines.append(("Forma płatności", plat["forma"]))
+    if plat.get("termin"):
+        info_lines.append(("Termin płatności", plat["termin"]))
+    if plat.get("zaplacono"):
+        info_lines.append(("Zapłacono", plat["zaplacono"]))
+    for r in plat.get("rachunki", []):
+        info_lines.append(("Rachunek", r.get("nr", "")))
+        if r.get("bank"):
+            info_lines.append(("Bank", r["bank"]))
+
+    if info_lines:
+        plat_h = 8 * mm + len(info_lines) * 4.5 * mm
+        _box(left_x, box_top - plat_h, CW / 2 - 2 * mm, plat_h, fill=_rl_colors.white)
+        c.setFillColor(COL_TABLE_HDR)
+        c.rect(left_x, box_top - 5 * mm, CW / 2 - 2 * mm, 5 * mm, stroke=0, fill=1)
+        c.setStrokeColor(COL_BORDER)
+        c.rect(left_x, box_top - 5 * mm, CW / 2 - 2 * mm, 5 * mm, stroke=1, fill=0)
+        _text(left_x + 2 * mm, box_top - 3.6 * mm, "PŁATNOŚĆ", font=font_bold, size=8)
+        py = box_top - 9 * mm
+        for lbl, val in info_lines:
+            _text(left_x + 2 * mm, py, lbl + ":", font=font_name, size=7, color=COL_MUTED)
+            _text(left_x + 30 * mm, py, val, font=font_name, size=8)
+            py -= 4.5 * mm
+        y_plat_bottom = box_top - plat_h
+    else:
+        y_plat_bottom = box_top
+
+    y = min(y_vat_bottom, y_plat_bottom) - 6 * mm
+
+    # ── Pasek RAZEM DO ZAPŁATY ─────────────────────────────────────────────
+    total_h = 12 * mm
+    c.setFillColor(COL_HEADER_BG)
+    c.rect(LM, y - total_h, CW, total_h, stroke=0, fill=1)
+    c.setFillColor(_rl_colors.white)
+    c.setFont(font_name, 9)
+    c.drawString(LM + 5 * mm, y - 5 * mm, "RAZEM DO ZAPŁATY")
+    c.setFont(font_bold, 16)
+    total_txt = f"{data.get('total_brutto', '0.00')} {data.get('kod_waluty', 'PLN')}"
+    c.drawRightString(LM + CW - 5 * mm, y - 8 * mm, total_txt)
+    y -= total_h + 4 * mm
+
+    # ── Adnotacje ──────────────────────────────────────────────────────────
+    if data.get("adnotacje"):
+        _text(LM, y, "Adnotacje:", font=font_bold, size=8, color=COL_MUTED)
+        y -= 4 * mm
+        for ln in data["adnotacje"]:
+            _text(LM + 3 * mm, y, "• " + ln, font=font_name, size=8)
+            y -= 4 * mm
+
+    # ── Stopka ─────────────────────────────────────────────────────────────
+    c.setFont(font_name, 7)
+    c.setFillColor(COL_MUTED)
+    footer = "Dokument wygenerowany z KSeF (FA(3))"
+    if ksef_number:
+        footer += f"  •  {ksef_number}"
+    c.drawString(LM, 10 * mm, footer)
+    c.drawRightString(LM + CW, 10 * mm, "KSeF Desktop")
+
+    c.save()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1597,87 +2222,181 @@ def parse_crystal_xml(xml_content: str) -> dict:
     }
     return data
 
+def _normalize_stawka(raw: str) -> str:
+    """Normalizuje stawkę VAT do postaci dopuszczalnej przez TStawkaPodatku w FA(3).
+
+    Dopuszczalne: 23, 22, 8, 7, 5, 4, 3, "0 KR", "0 WDT", "0 EX", "zw", "oo",
+    "np I", "np II".
+    """
+    if raw is None:
+        return '23'
+    s = str(raw).strip().replace('%', '').strip()
+    if not s:
+        return '23'
+    sl = s.lower().replace('.', '')
+    # warianty "zwolnione"
+    if sl in ('zw', 'zwolniona', 'zwolnione', 'zw.'):
+        return 'zw'
+    # odwrotne obciążenie
+    if sl in ('oo', 'odwr', 'odwrotne'):
+        return 'oo'
+    # niepodlegające
+    if sl.startswith('np'):
+        # "np", "np1", "np i", "np-i" → "np I"; "np2"/"np ii" → "np II"
+        if 'ii' in sl or '2' in sl:
+            return 'np II'
+        return 'np I'
+    # 0% – domyślnie KR (sprzedaż krajowa), chyba że oznaczono WDT/EX
+    if sl in ('0', '0 kr', '0kr'):
+        return '0 KR'
+    if sl in ('0 wdt', '0wdt', 'wdt'):
+        return '0 WDT'
+    if sl in ('0 ex', '0ex', 'ex', 'eksport'):
+        return '0 EX'
+    # liczbowe
+    if s in ('23', '22', '8', '7', '5', '4', '3'):
+        return s
+    # dopasowanie luźne "23%" → "23"
+    m = re.match(r'^(\d+)$', s)
+    if m:
+        v = m.group(1)
+        if v in ('23', '22', '8', '7', '5', '4', '3'):
+            return v
+    return s  # niezmienione – schema odrzuci, ale widać problem
+
+
+# Mapowanie stawki → (indeks P_13, indeks P_14 lub None, tuple sortowania)
+#   (P_13_1, P_14_1) – 23/22
+#   (P_13_2, P_14_2) – 8/7
+#   (P_13_3, P_14_3) – 5/4/3
+#   (P_13_5, P_14_5) – procedura szczególna (nie mapujemy z rate)
+#   (P_13_6_1)       – 0 KR
+#   (P_13_6_2)       – 0 WDT
+#   (P_13_6_3)       – 0 EX
+#   (P_13_7)         – zw
+#   (P_13_8)         – np I (poza terytorium kraju)
+#   (P_13_9)         – np II (art. 100 ust. 1 pkt 4)
+#   (P_13_10)        – oo (odwrotne obciążenie)
+_STAWKA_SLOTY = {
+    '23':    ('P_13_1',   'P_14_1',   (1, 0)),
+    '22':    ('P_13_1',   'P_14_1',   (1, 0)),
+    '8':     ('P_13_2',   'P_14_2',   (2, 0)),
+    '7':     ('P_13_2',   'P_14_2',   (2, 0)),
+    '5':     ('P_13_3',   'P_14_3',   (3, 0)),
+    '4':     ('P_13_3',   'P_14_3',   (3, 0)),
+    '3':     ('P_13_3',   'P_14_3',   (3, 0)),
+    '0 KR':  ('P_13_6_1', None,       (6, 1)),
+    '0 WDT': ('P_13_6_2', None,       (6, 2)),
+    '0 EX':  ('P_13_6_3', None,       (6, 3)),
+    'zw':    ('P_13_7',   None,       (7, 0)),
+    'np I':  ('P_13_8',   None,       (8, 0)),
+    'np II': ('P_13_9',   None,       (9, 0)),
+    'oo':    ('P_13_10',  None,       (10, 0)),
+}
+
+
 def build_fa3_xml(d: dict) -> str:
-    """Buduje XML FA(3) z danych słownikowych."""
-    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    """Buduje XML FA(3) zgodny ze schematem http://crd.gov.pl/wzor/2025/06/25/13775/."""
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    # Kwoty per stawka VAT — bierz z tabeli VAT (vat_rows), nie z pozycji
-    vat_groups = {}
-    for vr in d.get('vat_rows', []):
-        # Wyciągnij stawkę z nazwy, np. "Podstawowy podatek VAT 23%" → "23"
-        nazwa_stawki = vr.get('z1VNazwaStawkif1', '')
-        m = re.search(r'(\d+)\s*%', nazwa_stawki)
-        stawka = m.group(1) if m else '23'
-        netto  = float(vr.get('z1VObrotNettof1', '0') or 0)
-        vat_kw = float(vr.get('z1VKwotaVATf1', '0') or 0)
-        brutto = float(vr.get('z1VObrotBruttof1', '0') or 0)
-        vat_groups[stawka] = {'netto': netto, 'vat': vat_kw, 'brutto': brutto}
+    # ── 1. Grupowanie kwot po stawce VAT ──────────────────────────────────
+    # klucz = slot (nazwa P_13_x), wartość = dict{netto, vat, sort_key}
+    slots: dict[str, dict] = {}
 
-    # Fallback: jeśli brak vat_rows, oblicz z pozycji
-    if not vat_groups:
-        for row in d['items']:
-            stawka = row.get('z1StawkaVATf1', '23').replace('%', '').strip()
-            netto  = float(row.get('z1WartNettoZRabf1', '0') or 0)
-            vat    = float(row.get('z1WartVatZRabf1', '0') or 0)
-            brutto = float(row.get('z1WartBruttoZRabf1', '0') or 0)
-            if stawka not in vat_groups:
-                vat_groups[stawka] = {'netto': 0.0, 'vat': 0.0, 'brutto': 0.0}
-            vat_groups[stawka]['netto']  += netto
-            vat_groups[stawka]['vat']    += vat
-            vat_groups[stawka]['brutto'] += brutto
+    def _add_to_slot(stawka_norm: str, netto: float, vat: float):
+        info = _STAWKA_SLOTY.get(stawka_norm)
+        if not info:
+            return
+        p13, p14, sort_key = info
+        slot = slots.setdefault(p13, {'netto': 0.0, 'vat': 0.0,
+                                      'p14': p14, 'sort': sort_key})
+        slot['netto'] += netto
+        slot['vat']   += vat
 
-    total_netto  = _fmt(d['total_netto'])
-    total_vat    = _fmt(d['total_vat'])
+    # preferuj tabelę VAT z Crystal (vat_rows), fallback na pozycje
+    if d.get('vat_rows'):
+        for vr in d['vat_rows']:
+            nazwa = vr.get('z1VNazwaStawkif1', '')
+            m = re.search(r'(\d+)\s*%', nazwa) or re.search(r'(zw|np|oo)', nazwa, re.I)
+            stawka_raw = m.group(1) if m else '23'
+            if 'zw' in nazwa.lower():
+                stawka_raw = 'zw'
+            elif 'np' in nazwa.lower():
+                stawka_raw = 'np'
+            stawka_norm = _normalize_stawka(stawka_raw)
+            netto = float((vr.get('z1VObrotNettof1') or '0').replace(',', '.') or 0)
+            vat_kw = float((vr.get('z1VKwotaVATf1')   or '0').replace(',', '.') or 0)
+            _add_to_slot(stawka_norm, netto, vat_kw)
+    else:
+        for row in d.get('items', []):
+            stawka_norm = _normalize_stawka(row.get('z1StawkaVATf1', '23'))
+            netto = float((row.get('z1WartNettoZRabf1') or '0').replace(',', '.') or 0)
+            vat_kw = float((row.get('z1WartVatZRabf1')   or '0').replace(',', '.') or 0)
+            _add_to_slot(stawka_norm, netto, vat_kw)
+
+    # Emituj P_13_x / P_14_x w porządku zgodnym ze schematem (1 → 11)
+    kwoty_xml = ''
+    for p13_name, vals in sorted(slots.items(), key=lambda kv: kv[1]['sort']):
+        kwoty_xml += f"\n    <{p13_name}>{_fmt(vals['netto'])}</{p13_name}>"
+        if vals['p14']:
+            kwoty_xml += f"\n    <{vals['p14']}>{_fmt(vals['vat'])}</{vals['p14']}>"
+
     total_brutto = _fmt(d['total_brutto'])
 
     sp  = d['sprzedawca']
     nab = d['nabywca']
 
-    # Escapowanie nazw (mogą zawierać &, <, > itp.)
-    sp_nazwa = escape_xml(sp['nazwa'])
+    # ── 2. Escape + przygotowanie pól ─────────────────────────────────────
+    sp_nazwa  = escape_xml(sp['nazwa'])
     nab_nazwa = escape_xml(nab['nazwa'])
-    sp_l1 = escape_xml(sp['l1'])
-    sp_l2 = escape_xml(sp['l2'])
-    nab_l1 = escape_xml(nab['l1'])
-    nab_l2 = escape_xml(nab['l2'])
 
-    # --- Pozycje FA ---
+    def _adres_xml(l1: str, l2: str, indent: str) -> str:
+        """Buduje <Adres> z KodKraju + AdresL1 + opcjonalnym AdresL2."""
+        # AdresL1 jest wymagane (minLength=1). Jeśli brak → użyj l2 albo "-"
+        line1 = (l1 or l2 or '-').strip()
+        out = (f"{indent}<KodKraju>PL</KodKraju>\n"
+               f"{indent}<AdresL1>{escape_xml(line1)}</AdresL1>")
+        if l2 and l2.strip() and l2.strip() != line1:
+            out += f"\n{indent}<AdresL2>{escape_xml(l2.strip())}</AdresL2>"
+        return out
+
+    sp_adres  = _adres_xml(sp.get('l1', ''),  sp.get('l2', ''),  '      ')
+    nab_adres = _adres_xml(nab.get('l1', ''), nab.get('l2', ''), '      ')
+
+    # ── 3. Pozycje faktury ────────────────────────────────────────────────
     wiersze_xml = ''
-    for i, row in enumerate(d['items'], 1):
-        nazwa   = escape_xml(row.get('z1NazwaLubOpisf1', '').strip())
-        ilosc   = _fmt(row.get('z1Iloscf1', '1'), 3)
-        jm      = escape_xml(row.get('z1Jmf1', 'szt.'))
+    for i, row in enumerate(d.get('items', []), 1):
+        nazwa   = escape_xml((row.get('z1NazwaLubOpisf1', '') or '').strip() or 'Pozycja')
+        ilosc   = _fmt(row.get('z1Iloscf1', '1'), 6)
+        jm      = escape_xml((row.get('z1Jmf1', '') or 'szt').strip() or 'szt')
         cena    = _fmt(row.get('z1CenaNBzRabf1', '0'))
         netto   = _fmt(row.get('z1WartNettoZRabf1', '0'))
-        stawka  = row.get('z1StawkaVATf1', '23').replace('%', '').strip()
-        wiersze_xml += f"""
-  <FaWiersz>
-    <NrWierszaFa>{i}</NrWierszaFa>
-    <P_7>{nazwa}</P_7>
-    <P_8A>{jm}</P_8A>
-    <P_8B>{ilosc}</P_8B>
-    <P_9A>{cena}</P_9A>
-    <P_11>{netto}</P_11>
-    <P_12>{stawka}</P_12>
-  </FaWiersz>"""
+        stawka  = _normalize_stawka(row.get('z1StawkaVATf1', '23'))
+        wiersze_xml += (
+            "\n      <FaWiersz>"
+            f"\n        <NrWierszaFa>{i}</NrWierszaFa>"
+            f"\n        <P_7>{nazwa}</P_7>"
+            f"\n        <P_8A>{jm}</P_8A>"
+            f"\n        <P_8B>{ilosc}</P_8B>"
+            f"\n        <P_9A>{cena}</P_9A>"
+            f"\n        <P_11>{netto}</P_11>"
+            f"\n        <P_12>{stawka}</P_12>"
+            "\n      </FaWiersz>"
+        )
 
-    # --- Kwoty per stawka (P_13_x = netto, P_14_x = VAT) ---
-    stawka_map = {'23': ('1','1'), '8': ('2','2'), '5': ('3','3'), '0': ('5','5'), 'ZW': ('6',''), 'NP': ('10','')}
-    kwoty_xml = ''
-    for stawka, vals in vat_groups.items():
-        suffix = stawka_map.get(stawka, ('1','1'))
-        kwoty_xml += f"\n    <P_13_{suffix[0]}>{_fmt(vals['netto'])}</P_13_{suffix[0]}>"
-        if suffix[1]:
-            kwoty_xml += f"\n    <P_14_{suffix[1]}>{_fmt(vals['vat'])}</P_14_{suffix[1]}>"
+    # ── 4. Złożenie dokumentu ─────────────────────────────────────────────
+    # UWAGA: kolejność elementów wewnątrz <Fa> jest ściśle określona:
+    #   KodWaluty → P_1 → P_2 → P_6? → P_13_x → P_15 → Adnotacje
+    #   → RodzajFaktury → FaWiersz*
+    fa_p6 = f"\n    <P_6>{d['data_dostawy']}</P_6>" if d.get('data_dostawy') else ''
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/">
   <Naglowek>
     <KodFormularza kodSystemowy="FA (3)" wersjaSchemy="1-0E">FA</KodFormularza>
     <WariantFormularza>3</WariantFormularza>
     <DataWytworzeniaFa>{now_iso}</DataWytworzeniaFa>
-    <SystemInfo>KSeF Desktop – Konwerter Crystal Reports</SystemInfo>
+    <SystemInfo>KSeF Desktop</SystemInfo>
   </Naglowek>
   <Podmiot1>
     <DaneIdentyfikacyjne>
@@ -1685,8 +2404,7 @@ def build_fa3_xml(d: dict) -> str:
       <Nazwa>{sp_nazwa}</Nazwa>
     </DaneIdentyfikacyjne>
     <Adres>
-      <KodKraju>PL</KodKraju>
-      <AdresL1>{sp_l1}, {sp_l2}</AdresL1>
+{sp_adres}
     </Adres>
   </Podmiot1>
   <Podmiot2>
@@ -1694,14 +2412,16 @@ def build_fa3_xml(d: dict) -> str:
       <NIP>{nab['nip']}</NIP>
       <Nazwa>{nab_nazwa}</Nazwa>
     </DaneIdentyfikacyjne>
+    <Adres>
+{nab_adres}
+    </Adres>
     <JST>2</JST>
     <GV>2</GV>
   </Podmiot2>
   <Fa>
     <KodWaluty>PLN</KodWaluty>
     <P_1>{d['data_wystawienia']}</P_1>
-    <P_2>{escape_xml(d['nr'])}</P_2>
-    <P_6>{d['data_dostawy']}</P_6>{kwoty_xml}
+    <P_2>{escape_xml(d['nr'])}</P_2>{fa_p6}{kwoty_xml}
     <P_15>{total_brutto}</P_15>
     <Adnotacje>
       <P_16>2</P_16>
