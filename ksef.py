@@ -985,6 +985,9 @@ class SendTab(tk.Frame):
         """Próbuje rozpoznać XML Crystal Reports i skonwertować do FA(3).
         Zwraca (fa3_xml, info_text) lub None jeśli to nie Crystal Reports."""
         try:
+            # Nie próbuj konwertować jeśli to nie Crystal Reports
+            if 'urn:crystal-reports:schemas' not in xml_content:
+                return None
             d = parse_crystal_xml(xml_content)
             fa3 = build_fa3_xml(d)
 
@@ -2188,6 +2191,8 @@ def _vat_rows(root):
 
 def parse_crystal_xml(xml_content: str) -> dict:
     """Parsuje Crystal Reports XML i zwraca słownik danych faktury."""
+    if 'urn:crystal-reports:schemas' not in xml_content:
+        raise ValueError("To nie jest plik Crystal Reports XML")
     root = ET.fromstring(xml_content.encode('utf-8'))
 
     tytul = _get(root, 'Tytul')
@@ -2297,7 +2302,7 @@ _STAWKA_SLOTY = {
 
 def build_fa3_xml(d: dict) -> str:
     """Buduje XML FA(3) zgodny ze schematem http://crd.gov.pl/wzor/2025/06/25/13775/."""
-    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
     # ── 1. Grupowanie kwot po stawce VAT ──────────────────────────────────
     # klucz = slot (nazwa P_13_x), wartość = dict{netto, vat, sort_key}
@@ -2347,8 +2352,8 @@ def build_fa3_xml(d: dict) -> str:
     nab = d['nabywca']
 
     # ── 2. Escape + przygotowanie pól ─────────────────────────────────────
-    sp_nazwa  = escape_xml(sp['nazwa'])
-    nab_nazwa = escape_xml(nab['nazwa'])
+    sp_nazwa  = escape_xml(sp['nazwa']) or 'Sprzedawca'
+    nab_nazwa = escape_xml(nab['nazwa']) or 'Osoba fizyczna'
 
     def _adres_xml(l1: str, l2: str, indent: str) -> str:
         """Buduje <Adres> z KodKraju + AdresL1 (ulica, kod miasto)."""
@@ -2390,7 +2395,8 @@ def build_fa3_xml(d: dict) -> str:
     fa_p6 = f"\n    <P_6>{d['data_dostawy']}</P_6>" if d.get('data_dostawy') else ''
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/">
+<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <Naglowek>
     <KodFormularza kodSystemowy="FA (3)" wersjaSchemy="1-0E">FA</KodFormularza>
     <WariantFormularza>3</WariantFormularza>
@@ -2408,7 +2414,7 @@ def build_fa3_xml(d: dict) -> str:
   </Podmiot1>
   <Podmiot2>
     <DaneIdentyfikacyjne>
-      <NIP>{nab['nip']}</NIP>
+      {('<NIP>' + nab['nip'] + '</NIP>') if nab['nip'] else '<BrakID>1</BrakID>'}
       <Nazwa>{nab_nazwa}</Nazwa>
     </DaneIdentyfikacyjne>
     <Adres>
