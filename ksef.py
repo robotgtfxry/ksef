@@ -2351,13 +2351,12 @@ def build_fa3_xml(d: dict) -> str:
     nab_nazwa = escape_xml(nab['nazwa'])
 
     def _adres_xml(l1: str, l2: str, indent: str) -> str:
-        """Buduje <Adres> z KodKraju + AdresL1 + opcjonalnym AdresL2."""
-        # AdresL1 jest wymagane (minLength=1). Jeśli brak → użyj l2 albo "-"
-        line1 = (l1 or l2 or '-').strip()
+        """Buduje <Adres> z KodKraju + AdresL1 (ulica, kod miasto)."""
+        # Łączy ulicę i miasto w jedną linię AdresL1
+        parts = [p.strip() for p in (l1, l2) if p and p.strip()]
+        line1 = ', '.join(parts) if parts else '-'
         out = (f"{indent}<KodKraju>PL</KodKraju>\n"
                f"{indent}<AdresL1>{escape_xml(line1)}</AdresL1>")
-        if l2 and l2.strip() and l2.strip() != line1:
-            out += f"\n{indent}<AdresL2>{escape_xml(l2.strip())}</AdresL2>"
         return out
 
     sp_adres  = _adres_xml(sp.get('l1', ''),  sp.get('l2', ''),  '      ')
@@ -2367,7 +2366,7 @@ def build_fa3_xml(d: dict) -> str:
     wiersze_xml = ''
     for i, row in enumerate(d.get('items', []), 1):
         nazwa   = escape_xml((row.get('z1NazwaLubOpisf1', '') or '').strip() or 'Pozycja')
-        ilosc   = _fmt(row.get('z1Iloscf1', '1'), 6)
+        ilosc   = _fmt(row.get('z1Iloscf1', '1'), 3)
         jm      = escape_xml((row.get('z1Jmf1', '') or 'szt').strip() or 'szt')
         cena    = _fmt(row.get('z1CenaNBzRabf1', '0'))
         netto   = _fmt(row.get('z1WartNettoZRabf1', '0'))
@@ -2396,7 +2395,7 @@ def build_fa3_xml(d: dict) -> str:
     <KodFormularza kodSystemowy="FA (3)" wersjaSchemy="1-0E">FA</KodFormularza>
     <WariantFormularza>3</WariantFormularza>
     <DataWytworzeniaFa>{now_iso}</DataWytworzeniaFa>
-    <SystemInfo>KSeF Desktop</SystemInfo>
+    <SystemInfo>KSeF Desktop \u2013 Konwerter Crystal Reports</SystemInfo>
   </Naglowek>
   <Podmiot1>
     <DaneIdentyfikacyjne>
