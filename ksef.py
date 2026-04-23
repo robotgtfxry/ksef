@@ -2204,6 +2204,50 @@ def parse_crystal_xml(xml_content: str) -> dict:
     sp_l1, sp_l2   = _parse_addr(sp_adres_raw)
     nab_l1, nab_l2 = _parse_addr(nab_adres_raw)
 
+    # Numer rachunku bankowego – próbuj znane nazwy pól, fallback: skan IBAN/NRB
+    _rachunek_fields = [
+        'FldNumerRachunku', 'FldRachunekBankowy', 'FldNrKonta',
+        'FldNrRachunkuBankowego', 'FldNrRachunku', 'FldKontoNr',
+        'FldNumerKonta', 'FldRachunekNr', 'FldBankAccount',
+    ]
+    nr_rachunku = ''
+    for fn in _rachunek_fields:
+        v = _get(root, fn)
+        if v:
+            nr_rachunku = v
+            break
+    if not nr_rachunku:
+        # fallback: znajdź dowolne pole zawierające 26 cyfr (NRB) lub PL+26 cyfr (IBAN)
+        iban_re = re.compile(r'\b(?:PL)?\d{2}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}\b')
+        for obj in root.iter(_t('FormattedReportObject')):
+            v_el = obj.find(_t('Value'))
+            if v_el is not None and v_el.text:
+                m = iban_re.search(v_el.text)
+                if m:
+                    nr_rachunku = re.sub(r'\s', '', m.group())
+                    break
+
+    def _normalize_iban(nr: str) -> str:
+        """Dodaje prefix PL jeśli brak i usuwa spacje."""
+        nr = re.sub(r'\s', '', nr)
+        if re.match(r'^\d{26}$', nr):
+            nr = 'PL' + nr
+        return nr
+
+    nr_rachunku = _normalize_iban(nr_rachunku) if nr_rachunku else ''
+
+    # Termin płatności
+    _termin_fields = [
+        'FldTerminPlatnosci', 'FldDataPlatnosci', 'FldTermin',
+        'FldTerminZaplaty', 'FldDataZaplaty', 'FldPaymentDueDate',
+    ]
+    termin_platnosci = ''
+    for fn in _termin_fields:
+        v = _get(root, fn)
+        if v:
+            termin_platnosci = v
+            break
+
     data = {
         'nr':              nr_faktury,
         'data_wystawienia': _get(root, 'FldDataWyst'),
@@ -2224,6 +2268,8 @@ def parse_crystal_xml(xml_content: str) -> dict:
         'total_brutto': _get(root, 'Field3'),
         'items':        _detail_rows(root),
         'vat_rows':     _vat_rows(root),
+        'nr_rachunku':  nr_rachunku,
+        'termin_platnosci': termin_platnosci,
     }
     return data
 
@@ -2388,10 +2434,26 @@ def build_fa3_xml(d: dict) -> str:
             "\n      </FaWiersz>"
         )
 
-    # ── 4. Złożenie dokumentu ─────────────────────────────────────────────
+    # ── 4. Sekcja Platnosc ────────────────────────────────────────────────
+    nr_rb = d.get('nr_rachunku', '')
+    platnosc_xml = ''
+    if nr_rb:
+        termin = d.get('termin_platnosci', '')
+        termin_xml = f"\n      <ZaplataDo>{escape_xml(termin)}</ZaplataDo>" if termin else ''
+        platnosc_xml = (
+            "\n      <Platnosc>"
+            f"{termin_xml}"
+            "\n        <FormaPlatnosci>6</FormaPlatnosci>"
+            "\n        <RachunekBankowy>"
+            f"\n          <NrRB>{escape_xml(nr_rb)}</NrRB>"
+            "\n        </RachunekBankowy>"
+            "\n      </Platnosc>"
+        )
+
+    # ── 5. Złożenie dokumentu ─────────────────────────────────────────────
     # UWAGA: kolejność elementów wewnątrz <Fa> jest ściśle określona:
     #   KodWaluty → P_1 → P_2 → P_6? → P_13_x → P_15 → Adnotacje
-    #   → RodzajFaktury → FaWiersz*
+    #   → RodzajFaktury → FaWiersz* → Platnosc
     fa_p6 = f"\n    <P_6>{d['data_dostawy']}</P_6>" if d.get('data_dostawy') else ''
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -2444,7 +2506,7 @@ def build_fa3_xml(d: dict) -> str:
         <P_PMarzyN>1</P_PMarzyN>
       </PMarzy>
     </Adnotacje>
-    <RodzajFaktury>VAT</RodzajFaktury>{wiersze_xml}
+    <RodzajFaktury>VAT</RodzajFaktury>{wiersze_xml}{platnosc_xml}
   </Fa>
 </Faktura>"""
     return xml
@@ -2609,6 +2671,10 @@ class ConvertTab(tk.Frame):
                 f"  Razem VAT:     {d['total_vat']} PLN\n"
                 f"  Razem brutto:  {d['total_brutto']} PLN\n"
             )
+            if d.get('nr_rachunku'):
+                info += f"\nRachunek bankowy: {d['nr_rachunku']}\n"
+            if d.get('termin_platnosci'):
+                info += f"Termin płatności: {d['termin_platnosci']}\n"
             self._set_info(info)
             self._set_xml(self._fa3_xml)
             self.status_lbl.config(text="Konwersja OK ✔", fg=COLOR_SUCCESS)
