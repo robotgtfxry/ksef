@@ -2270,6 +2270,7 @@ def parse_crystal_xml(xml_content: str) -> dict:
         'vat_rows':     _vat_rows(root),
         'nr_rachunku':  nr_rachunku,
         'termin_platnosci': termin_platnosci,
+        'uwagi':        _get(root, 'FldUwagi'),
     }
     return data
 
@@ -2450,7 +2451,11 @@ def build_fa3_xml(d: dict) -> str:
             "\n      </Platnosc>"
         )
 
-    # ── 5. Złożenie dokumentu ─────────────────────────────────────────────
+    # ── 5. Uwagi ──────────────────────────────────────────────────────────
+    uwagi_raw = d.get('uwagi', '').strip()
+    uwagi_xml = f"\n    <Uwagi>{escape_xml(uwagi_raw)}</Uwagi>" if uwagi_raw else ''
+
+    # ── 6. Złożenie dokumentu ─────────────────────────────────────────────
     # UWAGA: kolejność elementów wewnątrz <Fa> jest ściśle określona:
     #   KodWaluty → P_1 → P_2 → P_6? → P_13_x → P_15 → Adnotacje
     #   → RodzajFaktury → FaWiersz* → Platnosc
@@ -2506,7 +2511,7 @@ def build_fa3_xml(d: dict) -> str:
         <P_PMarzyN>1</P_PMarzyN>
       </PMarzy>
     </Adnotacje>
-    <RodzajFaktury>VAT</RodzajFaktury>{wiersze_xml}{platnosc_xml}
+    <RodzajFaktury>VAT</RodzajFaktury>{uwagi_xml}{wiersze_xml}{platnosc_xml}
   </Fa>
 </Faktura>"""
     return xml
