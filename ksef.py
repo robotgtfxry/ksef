@@ -2451,14 +2451,19 @@ def build_fa3_xml(d: dict) -> str:
             "\n      </Platnosc>"
         )
 
-    # ── 5. Uwagi ──────────────────────────────────────────────────────────
+    # ── 5. DodatkowyOpis (dawne Uwagi – w schemacie FA(3) element Uwagi nie istnieje) ──
     uwagi_raw = d.get('uwagi', '').strip()
-    uwagi_xml = f"\n    <Uwagi>{escape_xml(uwagi_raw)}</Uwagi>" if uwagi_raw else ''
+    uwagi_xml = (
+        f"\n    <DodatkowyOpis>"
+        f"\n      <Klucz>Uwagi</Klucz>"
+        f"\n      <Wartosc>{escape_xml(uwagi_raw)}</Wartosc>"
+        f"\n    </DodatkowyOpis>"
+    ) if uwagi_raw else ''
 
     # ── 6. Złożenie dokumentu ─────────────────────────────────────────────
     # UWAGA: kolejność elementów wewnątrz <Fa> jest ściśle określona:
     #   KodWaluty → P_1 → P_2 → P_6? → P_13_x → P_15 → Adnotacje
-    #   → RodzajFaktury → FaWiersz* → Platnosc
+    #   → RodzajFaktury → DodatkowyOpis? → FaWiersz* → Platnosc
     fa_p6 = f"\n    <P_6>{d['data_dostawy']}</P_6>" if d.get('data_dostawy') else ''
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
