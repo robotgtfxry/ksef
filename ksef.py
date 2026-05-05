@@ -2440,7 +2440,16 @@ def build_fa3_xml(d: dict) -> str:
     platnosc_xml = ''
     if nr_rb:
         termin = d.get('termin_platnosci', '')
-        termin_xml = f"\n      <ZaplataDo>{escape_xml(termin)}</ZaplataDo>" if termin else ''
+        if termin:
+            import re as _re
+            _m = _re.search(r'(\d{2})\.(\d{2})\.(\d{4})', termin)
+            if _m:
+                _iso = f"{_m.group(3)}-{_m.group(2)}-{_m.group(1)}"
+                termin_xml = f"\n        <TerminPlatnosci>\n          <Termin>{_iso}</Termin>\n        </TerminPlatnosci>"
+            else:
+                termin_xml = f"\n        <TerminPlatnosci>\n          <TerminOpis>{escape_xml(termin)}</TerminOpis>\n        </TerminPlatnosci>"
+        else:
+            termin_xml = ''
         platnosc_xml = (
             "\n      <Platnosc>"
             f"{termin_xml}"
