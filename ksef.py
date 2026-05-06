@@ -2248,6 +2248,33 @@ def parse_crystal_xml(xml_content: str) -> dict:
             termin_platnosci = v
             break
 
+    # Forma płatności
+    _forma_fields = [
+        'FldFormaPlatnosci', 'FldSposobPlatnosci', 'FldPaymentMethod',
+        'FldFormaZaplaty', 'FldSposobZaplaty', 'FldPayment',
+    ]
+    _forma_map = {
+        'gotówka': '1', 'gotowka': '1', 'cash': '1', 'got': '1',
+        'karta': '2', 'card': '2',
+        'bon': '3', 'voucher': '3',
+        'czek': '4', 'cheque': '4', 'check': '4',
+        'weksel': '5',
+        'przelew': '6', 'transfer': '6', 'bank': '6', 'bankowy': '6',
+        'mobilna': '7', 'blik': '7',
+    }
+    forma_platnosci = ''
+    for fn in _forma_fields:
+        v = _get(root, fn)
+        if v:
+            forma_platnosci = v.strip()
+            break
+    if forma_platnosci and not forma_platnosci.isdigit():
+        key = forma_platnosci.lower().strip('.')
+        for fragment, kod in _forma_map.items():
+            if fragment in key:
+                forma_platnosci = kod
+                break
+
     data = {
         'nr':              nr_faktury,
         'data_wystawienia': _get(root, 'FldDataWyst'),
@@ -2270,6 +2297,7 @@ def parse_crystal_xml(xml_content: str) -> dict:
         'vat_rows':     _vat_rows(root),
         'nr_rachunku':  nr_rachunku,
         'termin_platnosci': termin_platnosci,
+        'forma_platnosci': forma_platnosci,
         'uwagi':        _get(root, 'FldUwagi'),
     }
     return data
@@ -2437,28 +2465,33 @@ def build_fa3_xml(d: dict) -> str:
 
     # ── 4. Sekcja Platnosc ────────────────────────────────────────────────
     nr_rb = d.get('nr_rachunku', '')
+    forma = d.get('forma_platnosci', '').strip()
+    if not forma:
+        forma = '6' if nr_rb else '1'
     platnosc_xml = ''
-    if nr_rb:
-        termin = d.get('termin_platnosci', '')
-        if termin:
-            import re as _re
-            _m = _re.search(r'(\d{2})\.(\d{2})\.(\d{4})', termin)
-            if _m:
-                _iso = f"{_m.group(3)}-{_m.group(2)}-{_m.group(1)}"
-                termin_xml = f"\n        <TerminPlatnosci>\n          <Termin>{_iso}</Termin>\n        </TerminPlatnosci>"
-            else:
-                termin_xml = f"\n        <TerminPlatnosci>\n          <TerminOpis>{escape_xml(termin)}</TerminOpis>\n        </TerminPlatnosci>"
+    termin = d.get('termin_platnosci', '')
+    if termin:
+        import re as _re
+        _m = _re.search(r'(\d{2})\.(\d{2})\.(\d{4})', termin)
+        if _m:
+            _iso = f"{_m.group(3)}-{_m.group(2)}-{_m.group(1)}"
+            termin_xml = f"\n        <TerminPlatnosci>\n          <Termin>{_iso}</Termin>\n        </TerminPlatnosci>"
         else:
-            termin_xml = ''
-        platnosc_xml = (
-            "\n      <Platnosc>"
-            f"{termin_xml}"
-            "\n        <FormaPlatnosci>6</FormaPlatnosci>"
-            "\n        <RachunekBankowy>"
-            f"\n          <NrRB>{escape_xml(nr_rb)}</NrRB>"
-            "\n        </RachunekBankowy>"
-            "\n      </Platnosc>"
-        )
+            termin_xml = f"\n        <TerminPlatnosci>\n          <TerminOpis>{escape_xml(termin)}</TerminOpis>\n        </TerminPlatnosci>"
+    else:
+        termin_xml = ''
+    rachunek_xml = (
+        "\n        <RachunekBankowy>"
+        f"\n          <NrRB>{escape_xml(nr_rb)}</NrRB>"
+        "\n        </RachunekBankowy>"
+    ) if nr_rb else ''
+    platnosc_xml = (
+        "\n      <Platnosc>"
+        f"{termin_xml}"
+        f"\n        <FormaPlatnosci>{escape_xml(forma)}</FormaPlatnosci>"
+        f"{rachunek_xml}"
+        "\n      </Platnosc>"
+    )
 
     # ── 5. DodatkowyOpis (dawne Uwagi – w schemacie FA(3) element Uwagi nie istnieje) ──
     uwagi_raw = d.get('uwagi', '').strip()
