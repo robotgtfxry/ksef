@@ -1018,12 +1018,21 @@ class SendTab(tk.Frame):
                     f"VAT: {row.get('z1WartVatZRabf1','')}  "
                     f"Brutto: {row.get('z1WartBruttoZRabf1','')}\n"
                 )
+            _forma_lbl_map = {"1":"gotówka","2":"karta","3":"bon","4":"czek","5":"weksel","6":"przelew","7":"mobilna"}
+            _fp_raw = d.get('forma_platnosci') or ("1" if not d.get('nr_rachunku') else "")
+            _fp = _forma_lbl_map.get(_fp_raw, _fp_raw)
             info += (
                 f"\n{'─'*44}\n"
                 f"  Razem netto:   {d['total_netto']} PLN\n"
                 f"  Razem VAT:     {d['total_vat']} PLN\n"
                 f"  Razem brutto:  {d['total_brutto']} PLN\n"
             )
+            if _fp:
+                info += f"\nForma płatności:  {_fp}\n"
+            if d.get('nr_rachunku'):
+                info += f"Rachunek bankowy: {d['nr_rachunku']}\n"
+            if d.get('termin_platnosci'):
+                info += f"Termin płatności: {d['termin_platnosci']}\n"
             return fa3, info
         except Exception:
             return None
@@ -1908,8 +1917,9 @@ def render_invoice_pdf(data: dict, out_path: str, ksef_number: str = "") -> None
     # Płatność
     plat = data.get("platnosc", {})
     info_lines = []
-    if plat.get("forma"):
-        info_lines.append(("Forma płatności", plat["forma"]))
+    forma = plat.get("forma") or ("gotówka" if not plat.get("rachunki") else "")
+    if forma:
+        info_lines.append(("Forma płatności", forma))
     if plat.get("termin"):
         info_lines.append(("Termin płatności", plat["termin"]))
     if plat.get("zaplacono"):
@@ -2140,6 +2150,13 @@ def _get(root, obj_name, vtag='Value'):
             return (v.text or '').strip() if v is not None else ''
     return ''
 
+def _has(root, obj_name):
+    for obj in root.iter(_t('FormattedReportObject')):
+        n = obj.find(_t('ObjectName'))
+        if n is not None and n.text == obj_name:
+            return True
+    return False
+
 def _parse_nip(raw):
     return re.sub(r'[^0-9]', '', raw)
 
@@ -2263,17 +2280,20 @@ def parse_crystal_xml(xml_content: str) -> dict:
         'mobilna': '7', 'blik': '7',
     }
     forma_platnosci = ''
-    for fn in _forma_fields:
-        v = _get(root, fn)
-        if v:
-            forma_platnosci = v.strip()
-            break
-    if forma_platnosci and not forma_platnosci.isdigit():
-        key = forma_platnosci.lower().strip('.')
-        for fragment, kod in _forma_map.items():
-            if fragment in key:
-                forma_platnosci = kod
+    if _has(root, 'FldZaplGotowka'):
+        forma_platnosci = '1'
+    else:
+        for fn in _forma_fields:
+            v = _get(root, fn)
+            if v:
+                forma_platnosci = v.strip()
                 break
+        if forma_platnosci and not forma_platnosci.isdigit():
+            key = forma_platnosci.lower().strip('.')
+            for fragment, kod in _forma_map.items():
+                if fragment in key:
+                    forma_platnosci = kod
+                    break
 
     data = {
         'nr':              nr_faktury,
@@ -2723,8 +2743,13 @@ class ConvertTab(tk.Frame):
                 f"  Razem VAT:     {d['total_vat']} PLN\n"
                 f"  Razem brutto:  {d['total_brutto']} PLN\n"
             )
+            _forma_lbl_map = {"1":"gotówka","2":"karta","3":"bon","4":"czek","5":"weksel","6":"przelew","7":"mobilna"}
+            _fp_raw = d.get('forma_platnosci') or ("1" if not d.get('nr_rachunku') else "")
+            _fp = _forma_lbl_map.get(_fp_raw, _fp_raw)
+            if _fp:
+                info += f"\nForma płatności:  {_fp}\n"
             if d.get('nr_rachunku'):
-                info += f"\nRachunek bankowy: {d['nr_rachunku']}\n"
+                info += f"Rachunek bankowy: {d['nr_rachunku']}\n"
             if d.get('termin_platnosci'):
                 info += f"Termin płatności: {d['termin_platnosci']}\n"
             self._set_info(info)
